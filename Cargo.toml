@@ -1,0 +1,56 @@
+[package]
+name = "sort-governor"
+version = "0.1.0"
+description = "Process-wide governor for bounded asynchronous sorting: plans in-memory versus external sorts and rations file descriptors and spill memory"
+authors = ["Jacobus Geluk <jacobus.geluk@dataroad.com>"]
+edition = "2024"
+rust-version = "1.89"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/legra-ai/sort-governor"
+documentation = "https://docs.rs/sort-governor"
+readme = "README.md"
+build = "build.rs"
+keywords = ["sort", "external-sort", "async", "bounded-memory", "tokio"]
+categories = ["algorithms", "asynchronous", "memory-management"]
+include = [
+    "Cargo.toml",
+    "README.md",
+    "LICENSE-APACHE",
+    "LICENSE-MIT",
+    "build.rs",
+    "src/**/*.rs",
+]
+
+[dependencies]
+async-fs-io = "0.1.5"
+ciborium = "0.2"
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
+tokio = { version = "1", features = ["rt", "sync"] }
+tracing = "0.1"
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
+
+[build-dependencies]
+rhusky = "0.0.6"
+
+[lints.rust]
+missing_docs = "deny"
+unreachable_pub = "deny"
+
+[lints.rustdoc]
+missing_crate_level_docs = "deny"
+broken_intra_doc_links = "deny"
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "deny", priority = -1 }
+# `large_futures` computes the layout of every async opaque type; on current
+# nightlies that hits a rustc ICE ("unexpected rigid alias in layout_of after
+# normalization") for this crate's `async fn`s over `async-fs-io`. Stable
+# passes the lint clean. Re-enable once the compiler bug is fixed.
+large_futures = "allow"

@@ -1,0 +1,8 @@
+#!/bin/sh
+# Validate conventional commit format with mandatory scope.
+if ! grep -qE '^[a-z]+\([a-z0-9./-]+\)!?: .+' "$1"; then
+    echo "Error: Invalid commit message format."
+    echo "Required: type(scope): description"
+    echo "Example: feat(cache): add bounded cache"
+    exit 1
+fi
