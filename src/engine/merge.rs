@@ -22,6 +22,7 @@ use futures_util::{
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
+use crate::engine::cleanup::AsyncCleanupGuard;
 use crate::engine::row::RunRow;
 use crate::engine::run::{
     RunReader,
@@ -132,41 +133,6 @@ where
     }
 }
 
-/// Removes the sort's scratch directory asynchronously when the stream ends
-/// or is dropped.
-struct AsyncCleanupGuard {
-    dir: Option<PathBuf>,
-}
-
-impl AsyncCleanupGuard {
-    async fn cleanup(&mut self) -> Result<(), SorterError> {
-        let Some(dir) = self.dir.take() else {
-            return Ok(());
-        };
-        async_fs_io::remove_dir_all(&dir).await.map_err(Into::into)
-    }
-}
-
-impl Drop for AsyncCleanupGuard {
-    fn drop(&mut self) {
-        let Some(dir) = self.dir.take() else {
-            return;
-        };
-        let Ok(handle) = tokio::runtime::Handle::try_current() else {
-            tracing::error!(
-                dir = %dir.display(),
-                "sorter scratch cleanup was dropped outside a Tokio runtime"
-            );
-            return;
-        };
-        handle.spawn(async move {
-            if let Err(err) = async_fs_io::remove_dir_all(&dir).await {
-                tracing::error!(dir = %dir.display(), error = %err, "sorter scratch cleanup failed");
-            }
-        });
-    }
-}
-
 /// Merge a group of runs into one new run file, deleting the inputs.
 async fn merge_group_to_file<K, V>(
     paths: &[PathBuf],
@@ -205,6 +171,7 @@ pub(crate) async fn cascade_and_stream<K, V>(
     mut runs: Vec<PathBuf>,
     fan_in: usize,
     dir: PathBuf,
+    guard: AsyncCleanupGuard,
     dedup: bool,
     hold: Option<Box<dyn Send>>,
 ) -> Result<ValueStream<V>, SorterError>
@@ -212,9 +179,6 @@ where
     K: Ord + Clone + Serialize + DeserializeOwned + Send + 'static,
     V: Serialize + DeserializeOwned + Send + 'static,
 {
-    let guard = AsyncCleanupGuard {
-        dir: Some(dir.clone()),
-    };
     let mut pass = 0u32;
     while runs.len() > fan_in {
         let mut next = Vec::new();

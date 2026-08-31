@@ -11,6 +11,7 @@ use futures_util::stream;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
+use crate::engine::cleanup::AsyncCleanupGuard;
 use crate::engine::merge::{
     ValueStream,
     cascade_and_stream,
@@ -30,6 +31,10 @@ pub struct SortSession<K, V> {
     spills: Vec<PathBuf>,
     next_run: u32,
     hold: Option<Box<dyn Send>>,
+    /// Armed on the first spill; removes the scratch directory when the
+    /// session is dropped before [`SortSession::finish`], and is handed to
+    /// the output stream at `finish` so cleanup then follows the results.
+    cleanup: AsyncCleanupGuard,
 }
 
 impl<K, V> SortSession<K, V>
@@ -51,6 +56,7 @@ where
             spills: Vec::new(),
             next_run: 0,
             hold: None,
+            cleanup: AsyncCleanupGuard::disarmed(),
         }
     }
 
@@ -133,7 +139,10 @@ where
             self.spill().await?;
         }
         let hold = self.hold.take();
-        cascade_and_stream::<K, V>(self.spills, fan_in.max(2), self.dir, self.dedup, hold).await
+        let guard = std::mem::take(&mut self.cleanup);
+        let spills = std::mem::take(&mut self.spills);
+        let dir = self.dir.clone();
+        cascade_and_stream::<K, V>(spills, fan_in.max(2), dir, guard, self.dedup, hold).await
     }
 
     /// Stream the sorted in-memory buffer, collapsing equal keys when
@@ -167,6 +176,7 @@ where
         }
         self.buffer.sort_by(|left, right| left.key.cmp(&right.key));
         async_fs_io::ensure_dir(&self.dir).await?;
+        self.cleanup.arm(self.dir.clone());
         let path = self.dir.join(format!("run-{:06}.cbor", self.next_run));
         self.next_run += 1;
         let mut writer = RunWriter::create(path).await?;

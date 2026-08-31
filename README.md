@@ -111,7 +111,9 @@ bounded rather than letting the run count explode.
 - **Deterministic order.** Equal keys are emitted in run order; with dedup,
   the first row of each equal-key group survives.
 - **Self-cleaning.** The scratch directory is created lazily on the first
-  spill and removed when the output stream ends or is dropped.
+  spill and removed when the output stream ends or is dropped — and also when
+  a spilled session is dropped before `finish()` (an error-path bail-out
+  cannot leak run files).
 - **Fail fast.** I/O, encode, and decode failures surface as typed
   `SorterError` variants; there are no silent fallbacks.
 

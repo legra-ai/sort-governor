@@ -1,6 +1,6 @@
 [package]
 name = "sort-governor"
-version = "0.1.0"
+version = "0.1.1"
 description = "Process-wide governor for bounded asynchronous sorting: plans in-memory versus external sorts and rations file descriptors and spill memory"
 authors = ["Jacobus Geluk <jacobus.geluk@dataroad.com>"]
 edition = "2024"

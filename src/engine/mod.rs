@@ -2,6 +2,7 @@
 //! spills, and merges according to a [`crate::SortPlan`], backed by a
 //! bounded async cascade merge over `async-fs-io`.
 
+mod cleanup;
 mod merge;
 mod row;
 mod run;

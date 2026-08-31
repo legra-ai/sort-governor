@@ -219,3 +219,28 @@ async fn truncated_run_surfaces_an_io_error() {
         .expect_err("a truncated run must fail");
     assert!(matches!(err, SorterError::Io(_)), "got {err:?}");
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn scratch_dir_is_removed_when_a_spilled_session_is_dropped_before_finish() {
+    let (_guard, dir) = scratch();
+    let plan = SortPlan::External {
+        run_buffer_bytes: 1,
+        max_fan_in: 2,
+    };
+    let mut session: SortSession<u32, u32> = SortSession::new(plan, dir.clone(), false);
+    for k in [3u32, 1, 2] {
+        session.push_with_size(k, k, 100).await.expect("push");
+    }
+    assert!(dir.is_dir(), "spills must have created the scratch dir");
+    // A caller bailing on an error path drops the session without finish().
+    drop(session);
+    // Cleanup is spawned onto the runtime on drop; give it a bounded window.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while dir.exists() && std::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(
+        !dir.exists(),
+        "scratch dir must be removed when a spilled session is dropped before finish"
+    );
+}
