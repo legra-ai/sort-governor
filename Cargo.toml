@@ -19,6 +19,7 @@ include = [
     "LICENSE-MIT",
     "build.rs",
     "src/**/*.rs",
+    "tests/**/*.rs",
 ]
 
 [dependencies]
