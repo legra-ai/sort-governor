@@ -20,6 +20,8 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      pull-requests: write
+      actions: write
     outputs:
       revision: ${{ steps.release.outputs.revision }}
       version: ${{ steps.release.outputs.version }}

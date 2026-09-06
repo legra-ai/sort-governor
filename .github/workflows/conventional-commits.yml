@@ -2,6 +2,12 @@ name: Conventional Commits
 on:
   pull_request_target:
     types: [opened, edited, synchronize, reopened, ready_for_review]
+  workflow_dispatch:
+    inputs:
+      pull_request:
+        description: Pull request number to validate (release pull requests raise no pull_request event)
+        required: true
+        type: string
 permissions:
   pull-requests: read
 jobs:
@@ -11,3 +17,5 @@ jobs:
     steps:
       # Trusted metadata-only action: never check out or execute PR code here.
       - uses: legra-ai/github-actions/.github/actions/conventional-commit@main
+        with:
+          pull-request: ${{ inputs.pull_request }}
