@@ -21,7 +21,7 @@ jobs:
     permissions:
       contents: write
       pull-requests: write
-      actions: write
+      statuses: write
     outputs:
       revision: ${{ steps.release.outputs.revision }}
       version: ${{ steps.release.outputs.version }}
