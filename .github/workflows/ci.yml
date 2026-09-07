@@ -37,8 +37,8 @@ jobs:
           repositories: ${{ github.event.repository.name }}
       - uses: legra-ai/github-actions/.github/actions/prepare-cargo-release@main
         id: release
-        env:
-          GH_TOKEN: ${{ steps.writer.outputs.token }}
+        with:
+          token: ${{ steps.writer.outputs.token }}
 
   test:
     needs: prepare
