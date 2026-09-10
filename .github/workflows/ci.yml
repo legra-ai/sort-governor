@@ -55,7 +55,7 @@ jobs:
         with:
           toolchain: ${{ steps.formatter.outputs.toolchain }}
           components: rustfmt
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - uses: actions-rust-lang/setup-rust-toolchain@v2
         with:
           components: clippy
       - run: ./scripts/fmt.sh --check
@@ -77,7 +77,7 @@ jobs:
         with:
           fetch-depth: 0
           ref: ${{ needs.prepare.outputs.revision }}
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - uses: actions-rust-lang/setup-rust-toolchain@v2
       - uses: legra-ai/github-actions/.github/actions/tag-tested-release@main
         with:
           version: ${{ needs.prepare.outputs.version }}
