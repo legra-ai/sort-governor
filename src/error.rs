@@ -13,6 +13,12 @@ pub enum SorterError {
     /// A run row could not be decoded from a spill file.
     #[error("sort row decode failed: {0}")]
     Decode(String),
+    /// The session has exhausted its checked 64-bit spill counter.
+    #[error("sort exceeds the maximum number of spill runs")]
+    RunLimit,
+    /// An earlier spill failed or was cancelled, invalidating this session.
+    #[error("sort session cannot continue after a failed or cancelled spill")]
+    SessionFailed,
     /// The governor actor is no longer running (its task ended or every
     /// handle was dropped), so the sort could not be admitted.
     #[error("sort governor is not running")]
