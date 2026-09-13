@@ -8,49 +8,55 @@ use crate::plan::SortPlan;
 
 #[tokio::test]
 async fn spill_frontier_stays_bounded_and_preserves_first_equal_row() {
-    for max_fan_in in [2, 3, 7] {
-        for dedup in [false, true] {
-            let mut session = SortSession::with_temp_dir(
-                SortPlan::External {
-                    run_buffer_bytes: 1,
-                    max_fan_in,
-                },
-                &std::env::temp_dir(),
-                dedup,
-            );
-            for sequence in 0..257u32 {
-                session
-                    .push_with_size(sequence % 7, sequence, 1)
-                    .await
-                    .expect("push");
-                assert!(
-                    session.spills.len() <= 64,
-                    "spill metadata grows with input"
-                );
-                let Some(mut files) = DirectoryReader::open_if_exists(session.scratch_dir())
-                    .await
-                    .expect("open scratch")
-                else {
-                    continue;
-                };
-                let mut count = 0;
-                while files.next().await.expect("next file").is_some() {
-                    count += 1;
-                    assert!(count <= 64, "spill files grow with input before finish");
-                }
+    for rows in [255, 257] {
+        for max_fan_in in [2, 3, 7] {
+            for dedup in [false, true] {
+                assert_bounded_sort(rows, max_fan_in, dedup).await;
             }
-            let mut output = session.finish().await.expect("finish");
-            for key in 0..7u32 {
-                for sequence in (key..257).step_by(7) {
-                    assert_eq!(output.next().await.expect("row").expect("value"), sequence);
-                    if dedup {
-                        break;
-                    }
-                }
-            }
-            assert!(output.next().await.is_none());
         }
     }
+}
+
+async fn assert_bounded_sort(rows: u32, max_fan_in: u32, dedup: bool) {
+    let mut session = SortSession::with_temp_dir(
+        SortPlan::External {
+            run_buffer_bytes: 1,
+            max_fan_in,
+        },
+        &std::env::temp_dir(),
+        dedup,
+    );
+    for sequence in 0..rows {
+        session
+            .push_with_size(sequence % 7, sequence, 1)
+            .await
+            .expect("push");
+        assert!(
+            session.spills.len() <= 64,
+            "spill metadata grows with input"
+        );
+        let Some(mut files) = DirectoryReader::open_if_exists(session.scratch_dir())
+            .await
+            .expect("open scratch")
+        else {
+            continue;
+        };
+        let mut count = 0;
+        while files.next().await.expect("next file").is_some() {
+            count += 1;
+            assert!(count <= 64, "spill files grow with input before finish");
+        }
+    }
+    let mut output = session.finish().await.expect("finish");
+    for key in 0..7u32 {
+        for sequence in (key..rows).step_by(7) {
+            assert_eq!(output.next().await.expect("row").expect("value"), sequence);
+            if dedup {
+                break;
+            }
+        }
+    }
+    assert!(output.next().await.is_none());
 }
 
 #[tokio::test]

@@ -37,7 +37,9 @@ independent failures once sorts run concurrently or inputs get large:
 descriptor pressure, one actor rations permits, every run reader holds
 exactly one descriptor and reads one row at a time over
 [`async-fs-io`](https://crates.io/crates/async-fs-io), and the cascade
-merge folds runs in passes so at most `fan_in` files are ever open.
+merge opens at most `fan_in` readers plus one output writer. During ingestion,
+a 64-level frontier combines adjacent runs as soon as their levels match;
+spill-path metadata stays fixed even when the input estimate is too small.
 
 ## Usage
 
@@ -96,16 +98,20 @@ A sort stays in memory only when its estimate fits under the configured
 ceiling *and* the available memory can hold it. Otherwise the planner shares
 the descriptor headroom across the sorts in flight (floored at two — a merge
 needs two inputs), then sizes the run buffer so the run count stays within
-`fan_in²` — at most a two-pass cascade — without exceeding available memory.
+`fan_in²` without exceeding available memory.
 Under descriptor pressure it deliberately spends memory to keep pass depth
-bounded rather than letting the run count explode.
+small. Incremental frontier compaction bounds metadata independently of that
+estimate, with logarithmic merge depth instead of repeatedly rewriting the
+whole accumulated input.
 
 ## Guarantees
 
 - **Bounded memory.** A session buffers at most one run; the merge holds one
-  head row per open reader. Nothing materialises the whole input.
-- **Bounded descriptors.** At most `max_fan_in` run files are open per sort,
-  and the governor's semaphore caps the total across sorts.
+  head row per open reader. Spill metadata occupies 64 optional path slots,
+  one per bit in the checked 64-bit run counter. Nothing materialises the
+  whole input.
+- **Bounded descriptors.** At most `max_fan_in` readers and one output writer are
+  open per sort. The governor's semaphore rations reader permits across sorts.
 - **Asynchronous throughout.** All spill and merge I/O is awaited over
   `async-fs-io`; no blocking calls run on Tokio worker threads.
 - **Deterministic order.** Equal keys are emitted in run order; with dedup,
@@ -115,7 +121,9 @@ bounded rather than letting the run count explode.
   a spilled session is dropped before `finish()` (an error-path bail-out
   cannot leak run files).
 - **Fail fast.** I/O, encode, and decode failures surface as typed
-  `SorterError` variants; there are no silent fallbacks.
+  `SorterError` variants; there are no silent fallbacks. Run-counter exhaustion
+  fails before creating another file. A failed or cancelled spill invalidates
+  the session so later calls cannot produce partial results.
 
 Row keys and values must implement `serde::Serialize` and
 `serde::de::DeserializeOwned`; spilled runs are framed CBOR.
