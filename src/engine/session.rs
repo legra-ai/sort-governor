@@ -15,11 +15,15 @@ use crate::engine::cleanup::AsyncCleanupGuard;
 use crate::engine::merge::{
     ValueStream,
     cascade_and_stream,
+    merge_group_to_file,
 };
 use crate::engine::row::RunRow;
 use crate::engine::run::RunWriter;
 use crate::error::SorterError;
 use crate::plan::SortPlan;
+
+#[cfg(test)]
+mod tests;
 
 /// An in-progress sort. Generic over the ordering key `K` and payload `V`.
 pub struct SortSession<K, V> {
@@ -28,8 +32,11 @@ pub struct SortSession<K, V> {
     dedup: bool,
     buffer: Vec<RunRow<K, V>>,
     buffer_bytes: usize,
-    spills: Vec<PathBuf>,
-    next_run: u32,
+    // bounded: one run per bit in the checked u64 spill count. Level n
+    // contains 2^n consecutive original runs; higher levels are older.
+    spills: [Option<PathBuf>; u64::BITS as usize],
+    next_run: u64,
+    failed: bool,
     hold: Option<Box<dyn Send>>,
     /// Armed on the first spill; removes the scratch directory when the
     /// session is dropped before [`SortSession::finish`], and is handed to
@@ -53,8 +60,9 @@ where
             dedup,
             buffer: Vec::new(),
             buffer_bytes: 0,
-            spills: Vec::new(),
+            spills: std::array::from_fn(|_| None),
             next_run: 0,
+            failed: false,
             hold: None,
             cleanup: AsyncCleanupGuard::disarmed(),
         }
@@ -90,13 +98,16 @@ where
     ///
     /// # Errors
     ///
-    /// Returns [`SorterError`] if spilling the current run fails.
+    /// Returns [`SorterError`] if spilling the current run fails. A failed
+    /// or cancelled spill invalidates the session; subsequent pushes and
+    /// [`Self::finish`] fail instead of yielding incomplete results.
     pub async fn push_with_size(
         &mut self,
         key: K,
         value: V,
         estimated_bytes: usize,
     ) -> Result<(), SorterError> {
+        self.ensure_usable()?;
         let bytes = estimated_bytes.max(1);
         if let SortPlan::External {
             run_buffer_bytes, ..
@@ -127,10 +138,11 @@ where
     ///
     /// Returns [`SorterError`] if a final spill or the merge setup fails.
     pub async fn finish(mut self) -> Result<ValueStream<V>, SorterError> {
+        self.ensure_usable()?;
         self.buffer.sort_by(|left, right| left.key.cmp(&right.key));
         let fan_in = match self.plan {
             SortPlan::InMemory => return Ok(self.in_memory_stream()),
-            SortPlan::External { .. } if self.spills.is_empty() => {
+            SortPlan::External { .. } if self.next_run == 0 => {
                 return Ok(self.in_memory_stream());
             }
             SortPlan::External { max_fan_in, .. } => max_fan_in as usize,
@@ -140,7 +152,14 @@ where
         }
         let hold = self.hold.take();
         let guard = std::mem::take(&mut self.cleanup);
-        let spills = std::mem::take(&mut self.spills);
+        // bounded: at most 64 frontier entries. Reverse levels to preserve
+        // chronological run order, including the first row among equal keys.
+        let spills = self
+            .spills
+            .iter_mut()
+            .rev()
+            .filter_map(Option::take)
+            .collect();
         let dir = self.dir.clone();
         cascade_and_stream::<K, V>(spills, fan_in.max(2), dir, guard, self.dedup, hold).await
     }
@@ -174,18 +193,41 @@ where
         if self.buffer.is_empty() {
             return Ok(());
         }
+        // Leave this set on errors and when the caller cancels this future:
+        // a partially merged frontier cannot be used again.
+        self.failed = true;
+        let ordinal = self.next_run;
+        self.next_run = ordinal.checked_add(1).ok_or(SorterError::RunLimit)?;
         self.buffer.sort_by(|left, right| left.key.cmp(&right.key));
         async_fs_io::ensure_dir(&self.dir).await?;
         self.cleanup.arm(self.dir.clone());
-        let path = self.dir.join(format!("run-{:06}.cbor", self.next_run));
-        self.next_run += 1;
+        let path = self.dir.join(format!("run-{ordinal:020}.cbor"));
         let mut writer = RunWriter::create(path).await?;
         for row in &self.buffer {
             writer.write_row(row).await?;
         }
-        self.spills.push(writer.finish().await?);
+        let mut run = writer.finish().await?;
         self.buffer.clear();
         self.buffer_bytes = 0;
+        for (level, slot) in self.spills.iter_mut().enumerate() {
+            let Some(older) = slot.take() else {
+                *slot = Some(run);
+                self.failed = false;
+                return Ok(());
+            };
+            let output = self
+                .dir
+                .join(format!("carry-{ordinal:020}-{level:02}.cbor"));
+            // bounded: two adjacent runs, older first for stable equal keys.
+            run = merge_group_to_file::<K, V>(&[older, run], output, false).await?;
+        }
+        unreachable!("a checked u64 spill count always fits in 64 frontier levels")
+    }
+
+    fn ensure_usable(&self) -> Result<(), SorterError> {
+        if self.failed {
+            return Err(SorterError::SessionFailed);
+        }
         Ok(())
     }
 }

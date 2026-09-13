@@ -3,9 +3,9 @@
 //! At most `fan_in` run files are open at once. When the run count exceeds
 //! `fan_in`, runs are merged in passes — each pass folds groups of `fan_in`
 //! runs into one — until `≤ fan_in` remain, then the final merge streams
-//! values out lazily. Memory and file descriptors stay
-//! `O(fan_in)` for any number of runs, so the process descriptor table can
-//! never be exhausted (the defect that crashed the old unbounded merge).
+//! values out lazily. The session compacts runs during ingestion so this
+//! final cascade receives at most 64 paths. Readers and head rows stay
+//! bounded by `fan_in`; file merges also hold one output writer.
 
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
@@ -134,7 +134,7 @@ where
 }
 
 /// Merge a group of runs into one new run file, deleting the inputs.
-async fn merge_group_to_file<K, V>(
+pub(crate) async fn merge_group_to_file<K, V>(
     paths: &[PathBuf],
     out: PathBuf,
     dedup: bool,
@@ -143,6 +143,7 @@ where
     K: Ord + Clone + Serialize + DeserializeOwned,
     V: Serialize + DeserializeOwned,
 {
+    // bounded: two frontier inputs or a final-cascade group of at most fan_in.
     let mut sources: Vec<MergeSource<K, V>> = Vec::with_capacity(paths.len());
     for path in paths {
         if let Some(source) = MergeSource::open(path).await? {
@@ -181,6 +182,7 @@ where
 {
     let mut pass = 0u32;
     while runs.len() > fan_in {
+        // bounded: the session hands over at most 64 frontier paths.
         let mut next = Vec::new();
         for (group_idx, group) in runs.chunks(fan_in).enumerate() {
             if group.len() == 1 {
@@ -193,6 +195,7 @@ where
         runs = next;
         pass += 1;
     }
+    // bounded: the final cascade has reduced the frontier to at most fan_in.
     let mut sources: Vec<MergeSource<K, V>> = Vec::with_capacity(runs.len());
     for path in &runs {
         if let Some(source) = MergeSource::open(path).await? {
