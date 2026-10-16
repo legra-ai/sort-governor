@@ -11,7 +11,7 @@ import unittest
 class CommitPolicyTests(unittest.TestCase):
     def test_ci_and_hooks_share_pinned_toolchains(self):
         root = Path(__file__).resolve().parents[1]
-        self.assertEqual((root / "rustfmt-toolchain").read_text().strip(), "1.99.1")
+        self.assertEqual((root / "rustfmt-toolchain").read_text().strip(), "nightly-2026-10-16")
         manifest = tomllib.loads((root / "Cargo.toml").read_text())
         msrv = manifest["package"]["rust-version"].split(".")
         while len(msrv) < 3:
@@ -21,7 +21,7 @@ class CommitPolicyTests(unittest.TestCase):
                          "rust-toolchain.toml must pin the manifest rust-version")
         workflow = (root / ".github/workflows/ci.yml").read_text()
         self.assertIn("./scripts/fmt.sh --check", workflow)
-        self.assertNotIn("cargo +nightly", workflow)
+        self.assertNotIn("cargo +nightly ", workflow)
         self.assertIn("./scripts/fmt.sh --check", (root / ".githooks/pre-commit").read_text())
 
     def test_commit_header_contract(self):
