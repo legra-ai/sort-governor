@@ -59,8 +59,9 @@ jobs:
         with:
           toolchain: 1.99.1
           components: clippy
-      - uses: dtolnay/rust-toolchain@nightly-2026-10-16
+      - uses: dtolnay/rust-toolchain@nightly
         with:
+          toolchain: nightly-2026-10-16
           components: rustfmt
       - run: ./scripts/fmt.sh --check
       - run: cargo test --locked --all-features --all-targets
