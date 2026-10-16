@@ -11,7 +11,7 @@ import unittest
 class CommitPolicyTests(unittest.TestCase):
     def test_ci_and_hooks_share_pinned_toolchains(self):
         root = Path(__file__).resolve().parents[1]
-        self.assertRegex((root / "rustfmt-toolchain").read_text().strip(), r"^nightly-\d{4}-\d{2}-\d{2}$")
+        self.assertEqual((root / "rustfmt-toolchain").read_text().strip(), "1.99.1")
         manifest = tomllib.loads((root / "Cargo.toml").read_text())
         msrv = manifest["package"]["rust-version"].split(".")
         while len(msrv) < 3:
