@@ -320,8 +320,17 @@ where
                 .cmp(&right.key)
                 .then(left.ordinal.cmp(&right.ordinal))
         });
-        async_fs_io::ensure_dir(&self.dir).await?;
         self.cleanup.arm(self.dir.clone());
+        let directory = self.dir.clone();
+        crate::engine::operation::perform(
+            Arc::clone(&self.fds),
+            self.cleanup.scope(),
+            async move {
+                async_fs_io::ensure_dir(&directory).await?;
+                Ok(())
+            },
+        )
+        .await?;
         let path = self.dir.join(format!("run-{ordinal:020}.cbor"));
         let mut writer = RunWriter::create(
             path,

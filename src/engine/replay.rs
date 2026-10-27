@@ -86,8 +86,17 @@ impl<V: Serialize + DeserializeOwned + Send + 'static> ReplayWriter<V> {
             })
             .ok_or(SorterError::RunLimit)?;
         self.metadata = Some(self.budget.reserve(metadata_bytes)?);
-        async_fs_io::ensure_dir(&self.dir).await?;
         self.cleanup.arm(self.dir.clone());
+        let directory = self.dir.clone();
+        crate::engine::operation::perform(
+            Arc::clone(&self.fds),
+            self.cleanup.scope(),
+            async move {
+                async_fs_io::ensure_dir(&directory).await?;
+                Ok(())
+            },
+        )
+        .await?;
         self.writer = Some(
             RunWriter::create(
                 self.dir.join("rows.cbor"),
@@ -251,3 +260,6 @@ impl<V: DeserializeOwned> ReplayCursor<V> {
         self.remaining = self.inner.rows;
     }
 }
+
+#[cfg(test)]
+mod tests;
