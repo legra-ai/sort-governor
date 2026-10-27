@@ -36,6 +36,9 @@ impl SorterHandle {
     /// number of usable file descriptors the Sorter may ration (the process
     /// soft limit minus a safety margin); sorts spill under unique
     /// directories beneath `scratch_root`.
+    ///
+    /// # Panics
+    /// Panics if the descriptor budget is zero.
     #[must_use]
     pub fn spawn(
         config: SorterConfig,
@@ -43,6 +46,7 @@ impl SorterHandle {
         pressure: Arc<dyn MemoryPressure>,
         scratch_root: PathBuf,
     ) -> Self {
+        assert!(fd_budget > 0, "sort descriptor budget must be positive");
         let (tx, rx) = mpsc::channel(COMMAND_CHANNEL_CAPACITY);
         let actor = SorterActor::new(config, fd_budget, pressure, scratch_root);
         tokio::spawn(actor.run(rx));

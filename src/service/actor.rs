@@ -45,15 +45,14 @@ pub(crate) struct SorterActor {
 }
 
 impl SorterActor {
-    /// Build an actor rationing `fd_budget` usable descriptors (floored at 2,
-    /// the minimum a merge needs).
+    /// Build an actor rationing exactly `fd_budget` usable descriptors.
     pub(crate) fn new(
         config: SorterConfig,
         fd_budget: u32,
         pressure: Arc<dyn MemoryPressure>,
         scratch_root: PathBuf,
     ) -> Self {
-        let fd_total = fd_budget.max(2);
+        let fd_total = fd_budget;
         let limit = config.max_run_buffer_bytes().min(
             pressure
                 .effective_target_bytes()
