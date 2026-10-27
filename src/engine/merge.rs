@@ -99,6 +99,7 @@ struct MergeState<K, V> {
     dedup: bool,
     last_key: Option<(K, MemoryCharge)>,
     budget: Arc<MemoryBudget>,
+    _arrays: MemoryCharge,
 }
 
 impl<K, V> MergeState<K, V>
@@ -106,29 +107,65 @@ where
     K: Ord + Clone + DeserializeOwned,
     V: DeserializeOwned,
 {
-    fn new(
-        mut sources: Vec<MergeSource<K, V>>,
-        dedup: bool,
-        budget: Arc<MemoryBudget>,
-    ) -> Result<Self, SorterError> {
-        let mut heap = BinaryHeap::new();
-        for (idx, source) in sources.iter_mut().enumerate() {
-            if let Some(head) = &source.head {
-                source.key_charge = Some(budget.reserve(head.retained_bytes)?);
-                let key = &head.key;
-                heap.push(Reverse(HeapEntry {
-                    key: key.clone(),
-                    idx,
-                }));
-            }
-        }
+    fn new(capacity: usize, dedup: bool, budget: Arc<MemoryBudget>) -> Result<Self, SorterError> {
+        let source_bytes = capacity
+            .checked_mul(std::mem::size_of::<MergeSource<K, V>>())
+            .ok_or(SorterError::RunLimit)?;
+        let heap_bytes = capacity
+            .checked_mul(std::mem::size_of::<Reverse<HeapEntry<K>>>())
+            .ok_or(SorterError::RunLimit)?;
+        let arrays = budget.reserve(
+            source_bytes
+                .checked_add(heap_bytes)
+                .ok_or(SorterError::RunLimit)?,
+        )?;
+        let sources = Vec::with_capacity(capacity);
+        let heap = BinaryHeap::with_capacity(capacity);
+        assert_eq!(
+            sources.capacity(),
+            capacity,
+            "exact source capacity reservation"
+        );
+        assert_eq!(heap.capacity(), capacity, "exact heap capacity reservation");
         Ok(Self {
             sources,
             heap,
             dedup,
             last_key: None,
             budget,
+            _arrays: arrays,
         })
+    }
+
+    async fn open(
+        paths: &[PathBuf],
+        dedup: bool,
+        fds: Arc<Semaphore>,
+        budget: Arc<MemoryBudget>,
+        io: Arc<IoScope>,
+    ) -> Result<Self, SorterError> {
+        let mut state = Self::new(paths.len(), dedup, Arc::clone(&budget))?;
+        for path in paths {
+            if let Some(mut source) = MergeSource::<K, V>::open(
+                path,
+                Arc::clone(&fds),
+                Arc::clone(&budget),
+                Arc::clone(&io),
+            )
+            .await?
+            {
+                let index = state.sources.len();
+                if let Some(head) = &source.head {
+                    source.key_charge = Some(budget.reserve(head.retained_bytes)?);
+                    state.heap.push(Reverse(HeapEntry {
+                        key: head.key.clone(),
+                        idx: index,
+                    }));
+                }
+                state.sources.push(source);
+            }
+        }
+        Ok(state)
     }
 
     /// Emit the next row in key order, collapsing equal keys when `dedup`.
@@ -179,16 +216,14 @@ where
     K: Ord + Clone + Serialize + DeserializeOwned,
     V: Serialize + DeserializeOwned,
 {
-    // bounded: two frontier inputs or a final-cascade group of at most fan_in.
-    let mut sources: Vec<MergeSource<K, V>> = Vec::with_capacity(paths.len());
-    for path in paths {
-        if let Some(source) =
-            MergeSource::open(path, Arc::clone(&fds), Arc::clone(&budget), Arc::clone(&io)).await?
-        {
-            sources.push(source);
-        }
-    }
-    let mut state = MergeState::new(sources, dedup, Arc::clone(&budget))?;
+    let mut state = MergeState::<K, V>::open(
+        paths,
+        dedup,
+        Arc::clone(&fds),
+        Arc::clone(&budget),
+        Arc::clone(&io),
+    )
+    .await?;
     let mut writer =
         RunWriter::create(out, Arc::clone(&fds), Arc::clone(&budget), Arc::clone(&io)).await?;
     while let Some(row) = state.next_row().await? {
@@ -250,16 +285,7 @@ where
         runs = next;
         pass += 1;
     }
-    // bounded: the final cascade has reduced the frontier to at most fan_in.
-    let mut sources: Vec<MergeSource<K, V>> = Vec::with_capacity(runs.len());
-    for path in &runs {
-        if let Some(source) =
-            MergeSource::open(path, Arc::clone(&fds), Arc::clone(&budget), Arc::clone(&io)).await?
-        {
-            sources.push(source);
-        }
-    }
-    let state = MergeState::new(sources, dedup, Arc::clone(&budget))?;
+    let state = MergeState::<K, V>::open(&runs, dedup, fds, budget, io).await?;
     Ok(Box::pin(value_stream(state, guard, hold)))
 }
 
@@ -314,3 +340,6 @@ where
         },
     ))
 }
+
+#[cfg(test)]
+mod tests;
