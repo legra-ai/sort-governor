@@ -7,6 +7,31 @@ use super::SortSession;
 use crate::plan::SortPlan;
 
 #[tokio::test]
+async fn oversized_retained_capacity_spills_before_the_next_row_arrives() {
+    let mut session = SortSession::<u32, Vec<u8>>::with_temp_dir(
+        SortPlan::InMemory,
+        &std::env::temp_dir(),
+        false,
+    )
+    .with_memory_limit_bytes(1024 * 1024);
+    // bounded: two empty vectors with real allocated capacities; serialization
+    // is tiny, so flushing the first needs no second large frame allocation.
+    let first = Vec::with_capacity(900 * 1024);
+    let first_bytes = first.capacity() + std::mem::size_of::<(u32, Vec<u8>)>();
+    session
+        .push_with_size(0, first, first_bytes)
+        .await
+        .expect("first row fits");
+    let next = Vec::with_capacity(96 * 1024);
+    let next_bytes = next.capacity() + std::mem::size_of::<(u32, Vec<u8>)>();
+    session
+        .push_with_size(1, next, next_bytes)
+        .await
+        .expect("flushable previous capacity must not deny the next row");
+    assert!(session.budget.peak() <= 1024 * 1024);
+}
+
+#[tokio::test]
 async fn spill_frontier_stays_bounded_and_preserves_first_equal_row() {
     for rows in [255, 257] {
         for max_fan_in in [2, 3, 7] {

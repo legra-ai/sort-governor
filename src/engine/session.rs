@@ -187,6 +187,9 @@ where
             .buffer_bytes
             .checked_add(bytes)
             .ok_or(SorterError::RunLimit)?;
+        if self.buffer_bytes >= self.buffer_limit() {
+            self.spill().await?;
+        }
         Ok(())
     }
 
