@@ -76,14 +76,30 @@ where
         .and_then(|size| size.checked_add(1024))
         .ok_or(SorterError::RunLimit)?;
     let metadata = memory.reserve(bytes)?;
-    let guard = scope.start();
-    let permit = fds.acquire_owned().await.map_err(|_| SorterError::Gone)?;
-    // bounded: at most one owned operation per descriptor permit. Detaching
-    // after caller cancellation is deliberate: its OS job is not cancellable.
-    // It performs no subsequent producer work and retains all I/O reservations.
-    tokio::spawn(async move {
+    perform_reserved(fds, scope, async move {
         let result = operation.await;
         drop(metadata);
+        result
+    })
+    .await
+}
+
+/// Run cleanup from its already-held metadata escrow, even when live
+/// headroom is zero. File ownership still follows the same operation scope.
+pub(crate) async fn perform_reserved<T, F>(
+    fds: Arc<Semaphore>,
+    scope: Arc<IoScope>,
+    operation: F,
+) -> Result<T, SorterError>
+where
+    T: Send + 'static,
+    F: Future<Output = Result<T, SorterError>> + Send + 'static,
+{
+    let guard = scope.start();
+    let permit = fds.acquire_owned().await.map_err(|_| SorterError::Gone)?;
+    // bounded: one owned filesystem job per actual descriptor permit.
+    tokio::spawn(async move {
+        let result = operation.await;
         drop(permit);
         drop(guard);
         result

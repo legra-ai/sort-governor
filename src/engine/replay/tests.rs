@@ -184,3 +184,55 @@ fn pending_cleanup_keeps_its_memory_reservation_until_filesystem_completion() {
         root.remove().await.unwrap();
     });
 }
+
+#[test]
+fn deferred_directory_cleanup_obeys_the_same_descriptor_budget() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .max_blocking_threads(1)
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let root = async_fs_io::TempDir::create(std::env::temp_dir())
+            .await
+            .unwrap();
+        let mut writer = ReplayWriter::<u32>::with_temp_dir(root.path(), 64 * 1024);
+        writer.append_with_size(3, 4).await.unwrap();
+        let replay = writer.seal().await.unwrap();
+        let directory = replay.inner.path.parent().unwrap().to_path_buf();
+        let budget = std::sync::Arc::clone(&replay.inner.budget);
+        let reserved = std::sync::Arc::clone(&replay.inner.fds)
+            .acquire_many_owned(2)
+            .await
+            .unwrap();
+        let (ready, started) = oneshot::channel();
+        let (release, gate) = mpsc::channel();
+        let os_worker = tokio::task::spawn_blocking(move || {
+            ready.send(()).unwrap();
+            let _ = gate.recv();
+        });
+        started.await.unwrap();
+        drop(replay);
+        tokio::task::yield_now().await;
+        release.send(()).unwrap();
+        os_worker.await.unwrap();
+        tokio::task::spawn_blocking(|| ()).await.unwrap();
+        assert!(
+            DirectoryReader::open_if_exists(&directory)
+                .await
+                .unwrap()
+                .is_some(),
+            "cleanup cannot open/remove directory state without a shared file permit"
+        );
+        assert!(budget.used() > 0);
+        drop(reserved);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while budget.used() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        root.remove().await.unwrap();
+    });
+}

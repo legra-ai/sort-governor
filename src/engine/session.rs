@@ -68,16 +68,19 @@ where
     /// the first spill, so a purely in-memory sort never touches disk.
     #[must_use]
     pub fn new(plan: SortPlan, dir: PathBuf, dedup: bool) -> Self {
+        let fds = Arc::new(Semaphore::new(match plan {
+            SortPlan::InMemory => 2,
+            SortPlan::External { max_fan_in, .. } => max_fan_in.max(2) as usize,
+        }));
+        let mut cleanup = AsyncCleanupGuard::disarmed();
+        cleanup.set_fd_budget(Arc::clone(&fds));
         Self {
             plan,
             budget: MemoryBudget::new(256 * 1024 * 1024),
             buffer_charge: None,
             metadata_reserved: false,
             next_row: 0,
-            fds: Arc::new(Semaphore::new(match plan {
-                SortPlan::InMemory => 2,
-                SortPlan::External { max_fan_in, .. } => max_fan_in.max(2) as usize,
-            })),
+            fds,
             dir,
             dedup,
             buffer: Vec::new(),
@@ -86,7 +89,7 @@ where
             next_run: 0,
             failed: false,
             hold: None,
-            cleanup: AsyncCleanupGuard::disarmed(),
+            cleanup,
         }
     }
 
@@ -109,6 +112,7 @@ where
     }
 
     pub(crate) fn with_fd_budget(mut self, fds: Arc<Semaphore>) -> Self {
+        self.cleanup.set_fd_budget(Arc::clone(&fds));
         self.fds = fds;
         self
     }

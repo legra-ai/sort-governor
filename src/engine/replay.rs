@@ -42,12 +42,14 @@ impl<V: Serialize + DeserializeOwned + Send + 'static> ReplayWriter<V> {
         budget: Arc<MemoryBudget>,
         lease: Option<SortLease>,
     ) -> Self {
+        let mut cleanup = AsyncCleanupGuard::disarmed();
+        cleanup.set_fd_budget(Arc::clone(&fds));
         Self {
             dir,
             writer: None,
             fds,
             budget,
-            cleanup: AsyncCleanupGuard::disarmed(),
+            cleanup,
             lease,
             rows: 0,
             failed: false,
