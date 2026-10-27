@@ -187,3 +187,90 @@ async fn independent_governors_never_reuse_a_live_scratch_identity() {
     drop((left, right));
     root.remove().await.unwrap();
 }
+
+#[tokio::test]
+async fn explicit_close_finishes_cleanup_before_releasing_its_reservation() {
+    let root = async_fs_io::TempDir::create(std::env::temp_dir())
+        .await
+        .unwrap();
+    let governor = SorterHandle::spawn(
+        SorterConfig::default(),
+        6,
+        Arc::new(StaticPressure::new(1024 * 1024, 0)),
+        root.path().join("close"),
+    );
+    let mut writer = governor.replay_writer::<u32>().await.unwrap();
+    writer.append_with_size(7, 4).await.unwrap();
+    let replay = writer.seal().await.unwrap();
+    let mut cursor = replay.cursor();
+    assert_eq!(cursor.next().await.unwrap(), Some(7));
+    assert_eq!(cursor.next().await.unwrap(), None);
+    drop(cursor);
+    assert!(governor.stats().await.unwrap().memory_bytes_used > 0);
+    replay.close().await.unwrap();
+    assert_eq!(governor.stats().await.unwrap().memory_bytes_used, 0);
+    let mut entries = async_fs_io::DirectoryReader::open(root.path().join("close"))
+        .await
+        .unwrap();
+    assert!(entries.next().await.unwrap().is_none());
+    drop(entries);
+    root.remove().await.unwrap();
+}
+
+#[tokio::test]
+async fn close_cannot_delete_storage_still_owned_by_a_cursor() {
+    let root = async_fs_io::TempDir::create(std::env::temp_dir())
+        .await
+        .unwrap();
+    let governor = SorterHandle::spawn(
+        SorterConfig::default(),
+        6,
+        Arc::new(StaticPressure::new(1024 * 1024, 0)),
+        root.path().join("in-use"),
+    );
+    let mut writer = governor.replay_writer::<u32>().await.unwrap();
+    writer.append_with_size(9, 4).await.unwrap();
+    let replay = writer.seal().await.unwrap();
+    let mut cursor = replay.cursor();
+    assert!(matches!(
+        replay.close().await,
+        Err(sort_governor::SorterError::ReplayInUse)
+    ));
+    assert_eq!(cursor.next().await.unwrap(), Some(9));
+    drop(cursor);
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while governor.stats().await.unwrap().memory_bytes_used != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    root.remove().await.unwrap();
+}
+
+#[tokio::test]
+async fn local_cap_configuration_cannot_replace_process_governance() {
+    let root = async_fs_io::TempDir::create(std::env::temp_dir())
+        .await
+        .unwrap();
+    let governor = SorterHandle::spawn(
+        SorterConfig::default(),
+        6,
+        Arc::new(StaticPressure::new(1024 * 1024, 0)),
+        root.path().to_path_buf(),
+    );
+    let lease = governor
+        .submit(sort_governor::SortSpec::new(0, 0))
+        .await
+        .unwrap();
+    let refused = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        lease
+            .into_session::<u32, u32>(false)
+            .with_memory_limit_bytes(1024)
+    }));
+    assert!(
+        refused.is_err(),
+        "local configuration must not replace the shared process budget"
+    );
+    root.remove().await.unwrap();
+}

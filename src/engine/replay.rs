@@ -197,6 +197,21 @@ pub struct Replay<V> {
     marker: PhantomData<fn() -> V>,
 }
 impl<V> Replay<V> {
+    /// Finish cleanup in-band after dropping all replay cursors. Completed
+    /// groups should close before constructing the next group; early query
+    /// cancellation still uses the bounded deferred-cleanup owner.
+    ///
+    /// # Errors
+    /// Returns [`SorterError::ReplayInUse`] if any cursor still owns storage,
+    /// or propagates a filesystem cleanup error. On an in-use error, existing
+    /// cursors retain ownership and can continue reading normally.
+    pub async fn close(self) -> Result<(), SorterError> {
+        let Ok(mut inner) = Arc::try_unwrap(self.inner) else {
+            return Err(SorterError::ReplayInUse);
+        };
+        inner.cleanup.cleanup().await
+    }
+
     /// Start an independent cursor. Cursor construction and cloning allocate no
     /// row buffers and hold no descriptors; active reads reserve their bytes.
     #[must_use]

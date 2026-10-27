@@ -122,7 +122,11 @@ same run codec, scratch lifecycle and shared budgets. Append with
 `next().await?` yields one owned value. Cloning a cursor checkpoints its current
 position; `rewind()` returns it to the beginning. Duplicate rows and insertion
 order are preserved. Cursors share storage ownership, allocate no row buffers
-when cloned, and retain no descriptor or decoded row between calls.
+when cloned, and retain no descriptor or decoded row between calls. Drop all
+cursors and call `replay.close().await?` when a group/relation is finished to
+complete cleanup in-band before constructing the next group. Closing while a
+cursor still owns storage returns a typed error; early-drop cleanup preserves
+that cursor's ownership.
 
 The standalone `SortSession::with_temp_dir` and
 `ReplayWriter::with_temp_dir(root, byte_cap)` use this same engine with local

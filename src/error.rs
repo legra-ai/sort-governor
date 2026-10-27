@@ -27,6 +27,10 @@ pub enum SorterError {
         /// Unreserved bytes remaining in the shared budget.
         available: u64,
     },
+    /// Explicit replay cleanup was requested while cursors still own its
+    /// storage.
+    #[error("cannot close replay while cursors still own its storage")]
+    ReplayInUse,
     /// An owned filesystem worker panicked or could not complete.
     #[error("sort filesystem worker failed: {0}")]
     Worker(String),
