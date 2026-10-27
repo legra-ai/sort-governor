@@ -14,6 +14,7 @@ use std::path::{
     PathBuf,
 };
 use std::pin::Pin;
+use std::sync::Arc;
 
 use futures_util::{
     Stream,
@@ -21,6 +22,7 @@ use futures_util::{
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
+use tokio::sync::Semaphore;
 
 use crate::engine::cleanup::AsyncCleanupGuard;
 use crate::engine::row::RunRow;
@@ -46,8 +48,8 @@ where
     V: DeserializeOwned,
 {
     /// Open a run and buffer its first row. Returns `None` for an empty run.
-    async fn open(path: &Path) -> Result<Option<Self>, SorterError> {
-        let mut reader = RunReader::open(path).await?;
+    async fn open(path: &Path, fds: Arc<Semaphore>) -> Result<Option<Self>, SorterError> {
+        let mut reader = RunReader::open(path, fds).await?;
         match reader.next_row().await? {
             Some(head) => Ok(Some(Self {
                 head: Some(head),
@@ -138,6 +140,7 @@ pub(crate) async fn merge_group_to_file<K, V>(
     paths: &[PathBuf],
     out: PathBuf,
     dedup: bool,
+    fds: Arc<Semaphore>,
 ) -> Result<PathBuf, SorterError>
 where
     K: Ord + Clone + Serialize + DeserializeOwned,
@@ -146,12 +149,12 @@ where
     // bounded: two frontier inputs or a final-cascade group of at most fan_in.
     let mut sources: Vec<MergeSource<K, V>> = Vec::with_capacity(paths.len());
     for path in paths {
-        if let Some(source) = MergeSource::open(path).await? {
+        if let Some(source) = MergeSource::open(path, Arc::clone(&fds)).await? {
             sources.push(source);
         }
     }
     let mut state = MergeState::new(sources, dedup);
-    let mut writer = RunWriter::create(out).await?;
+    let mut writer = RunWriter::create(out, Arc::clone(&fds)).await?;
     while let Some(row) = state.next_row().await? {
         writer.write_row(&row).await?;
     }
@@ -175,6 +178,7 @@ pub(crate) async fn cascade_and_stream<K, V>(
     guard: AsyncCleanupGuard,
     dedup: bool,
     hold: Option<Box<dyn Send>>,
+    fds: Arc<Semaphore>,
 ) -> Result<ValueStream<V>, SorterError>
 where
     K: Ord + Clone + Serialize + DeserializeOwned + Send + 'static,
@@ -190,7 +194,7 @@ where
                 continue;
             }
             let out = dir.join(format!("merge-{pass:03}-{group_idx:05}.cbor"));
-            next.push(merge_group_to_file::<K, V>(group, out, false).await?);
+            next.push(merge_group_to_file::<K, V>(group, out, false, Arc::clone(&fds)).await?);
         }
         runs = next;
         pass += 1;
@@ -198,7 +202,7 @@ where
     // bounded: the final cascade has reduced the frontier to at most fan_in.
     let mut sources: Vec<MergeSource<K, V>> = Vec::with_capacity(runs.len());
     for path in &runs {
-        if let Some(source) = MergeSource::open(path).await? {
+        if let Some(source) = MergeSource::open(path, Arc::clone(&fds)).await? {
             sources.push(source);
         }
     }

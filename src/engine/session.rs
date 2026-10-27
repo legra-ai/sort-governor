@@ -6,10 +6,12 @@ use std::path::{
     Path,
     PathBuf,
 };
+use std::sync::Arc;
 
 use futures_util::stream;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
+use tokio::sync::Semaphore;
 
 use crate::engine::cleanup::AsyncCleanupGuard;
 use crate::engine::merge::{
@@ -28,6 +30,7 @@ mod tests;
 /// An in-progress sort. Generic over the ordering key `K` and payload `V`.
 pub struct SortSession<K, V> {
     plan: SortPlan,
+    fds: Arc<Semaphore>,
     dir: PathBuf,
     dedup: bool,
     buffer: Vec<RunRow<K, V>>,
@@ -56,6 +59,10 @@ where
     pub fn new(plan: SortPlan, dir: PathBuf, dedup: bool) -> Self {
         Self {
             plan,
+            fds: Arc::new(Semaphore::new(match plan {
+                SortPlan::InMemory => 2,
+                SortPlan::External { max_fan_in, .. } => max_fan_in.max(2) as usize,
+            })),
             dir,
             dedup,
             buffer: Vec::new(),
@@ -78,11 +85,16 @@ where
     }
 
     /// Attach an opaque resource (typically the admission lease) to be held
-    /// alive for as long as this sort's output stream — so the fd permits
-    /// backing the sort are released only once its results are consumed.
+    /// alive for as long as this sort's output stream. File permits are
+    /// acquired separately for actual I/O and are never retained while idle.
     #[must_use]
     pub fn hold_resource(mut self, resource: Box<dyn Send>) -> Self {
         self.hold = Some(resource);
+        self
+    }
+
+    pub(crate) fn with_fd_budget(mut self, fds: Arc<Semaphore>) -> Self {
+        self.fds = fds;
         self
     }
 
@@ -161,7 +173,16 @@ where
             .filter_map(Option::take)
             .collect();
         let dir = self.dir.clone();
-        cascade_and_stream::<K, V>(spills, fan_in.max(2), dir, guard, self.dedup, hold).await
+        cascade_and_stream::<K, V>(
+            spills,
+            fan_in.max(2),
+            dir,
+            guard,
+            self.dedup,
+            hold,
+            Arc::clone(&self.fds),
+        )
+        .await
     }
 
     /// Stream the sorted in-memory buffer, collapsing equal keys when
@@ -202,7 +223,7 @@ where
         async_fs_io::ensure_dir(&self.dir).await?;
         self.cleanup.arm(self.dir.clone());
         let path = self.dir.join(format!("run-{ordinal:020}.cbor"));
-        let mut writer = RunWriter::create(path).await?;
+        let mut writer = RunWriter::create(path, Arc::clone(&self.fds)).await?;
         for row in &self.buffer {
             writer.write_row(row).await?;
         }
@@ -219,7 +240,8 @@ where
                 .dir
                 .join(format!("carry-{ordinal:020}-{level:02}.cbor"));
             // bounded: two adjacent runs, older first for stable equal keys.
-            run = merge_group_to_file::<K, V>(&[older, run], output, false).await?;
+            run = merge_group_to_file::<K, V>(&[older, run], output, false, Arc::clone(&self.fds))
+                .await?;
         }
         unreachable!("a checked u64 spill count always fits in 64 frontier levels")
     }

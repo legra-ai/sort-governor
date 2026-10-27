@@ -86,23 +86,22 @@ impl SorterActor {
         match plan {
             SortPlan::InMemory => {
                 self.in_memory_count += 1;
-                let _ = reply.send(Ok(SortLease::in_memory(plan, dir)));
+                let _ = reply.send(Ok(SortLease::in_memory(
+                    plan,
+                    dir,
+                    Arc::clone(&self.fd_budget),
+                )));
             }
-            SortPlan::External { max_fan_in, .. } => {
+            SortPlan::External { .. } => {
                 self.external_count += 1;
                 self.active.fetch_add(1, Ordering::Relaxed);
-                let sem = Arc::clone(&self.fd_budget);
-                let active = Arc::clone(&self.active);
-                // Acquire off the actor loop so a fully-committed fd budget
-                // backpressures this one sort without stalling the governor.
-                tokio::spawn(async move {
-                    let Ok(permit) = sem.acquire_many_owned(max_fan_in).await else {
-                        active.fetch_sub(1, Ordering::Relaxed);
-                        let _ = reply.send(Err(SorterError::Gone));
-                        return;
-                    };
-                    let _ = reply.send(Ok(SortLease::external(plan, dir, permit, active)));
-                });
+                let lease = SortLease::external(
+                    plan,
+                    dir,
+                    Arc::clone(&self.fd_budget),
+                    Arc::clone(&self.active),
+                );
+                let _ = reply.send(Ok(lease));
             }
         }
     }

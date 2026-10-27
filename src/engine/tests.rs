@@ -191,7 +191,10 @@ async fn corrupt_run_row_surfaces_a_decode_error() {
     file.flush().await.expect("flush");
     drop(file);
 
-    let mut reader: RunReader<u32, u32> = RunReader::open(&path).await.expect("open");
+    let mut reader: RunReader<u32, u32> =
+        RunReader::open(&path, std::sync::Arc::new(tokio::sync::Semaphore::new(2)))
+            .await
+            .expect("open");
     let err = reader
         .next_row()
         .await
@@ -212,7 +215,10 @@ async fn truncated_run_surfaces_an_io_error() {
     file.flush().await.expect("flush");
     drop(file);
 
-    let mut reader: RunReader<u32, u32> = RunReader::open(&path).await.expect("open");
+    let mut reader: RunReader<u32, u32> =
+        RunReader::open(&path, std::sync::Arc::new(tokio::sync::Semaphore::new(2)))
+            .await
+            .expect("open");
     let err = reader
         .next_row()
         .await

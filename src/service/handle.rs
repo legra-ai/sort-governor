@@ -46,7 +46,7 @@ impl SorterHandle {
         Self { tx }
     }
 
-    /// Admit a sort: the governor plans it, reserves its resources, and
+    /// Admit a sort: the governor plans it, shares its I/O budget, and
     /// returns a lease. The returned lease must be held until the sort's
     /// value stream is fully consumed.
     ///
