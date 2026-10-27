@@ -34,6 +34,20 @@ impl MemoryBudget {
         self.peak.load(Ordering::Acquire)
     }
 
+    pub(crate) fn reserve_frame(
+        self: &Arc<Self>,
+        bytes: usize,
+    ) -> Result<MemoryCharge, SorterError> {
+        // bounded: our exact-sized frame plus at most two frame lengths for
+        // Tokio's private file buffer capacity, with small framing reads.
+        // Files are reopened per operation, so no historical capacity remains.
+        let working = bytes
+            .checked_mul(3)
+            .and_then(|size| size.checked_add(32))
+            .ok_or(SorterError::RunLimit)?;
+        self.reserve(working)
+    }
+
     pub(crate) fn reserve(self: &Arc<Self>, bytes: usize) -> Result<MemoryCharge, SorterError> {
         let bytes = u64::try_from(bytes).map_err(|_| SorterError::RunLimit)?;
         let mut previous = self.used();

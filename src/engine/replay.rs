@@ -91,6 +91,8 @@ impl<V: Serialize + DeserializeOwned + Send + 'static> ReplayWriter<V> {
         crate::engine::operation::perform(
             Arc::clone(&self.fds),
             self.cleanup.scope(),
+            Arc::clone(&self.budget),
+            directory.capacity(),
             async move {
                 async_fs_io::ensure_dir(&directory).await?;
                 Ok(())

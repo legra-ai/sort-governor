@@ -16,6 +16,7 @@ use tokio::sync::{
     Semaphore,
 };
 
+use crate::engine::budget::MemoryBudget;
 use crate::error::SorterError;
 
 #[derive(Debug, Default)]
@@ -55,18 +56,33 @@ impl Drop for IoGuard {
 pub(crate) async fn perform<T, F>(
     fds: Arc<Semaphore>,
     scope: Arc<IoScope>,
+    memory: Arc<MemoryBudget>,
+    path_bytes: usize,
     operation: F,
 ) -> Result<T, SorterError>
 where
     T: Send + 'static,
     F: Future<Output = Result<T, SorterError>> + Send + 'static,
 {
+    // bounded: one worker future and path copies per admitted descriptor;
+    // fixed task bookkeeping is independent of relation size.
+    let bytes = std::mem::size_of::<F>()
+        .checked_mul(2)
+        .and_then(|size| {
+            path_bytes
+                .checked_mul(3)
+                .and_then(|paths| size.checked_add(paths))
+        })
+        .and_then(|size| size.checked_add(1024))
+        .ok_or(SorterError::RunLimit)?;
+    let metadata = memory.reserve(bytes)?;
     let guard = scope.start();
     let permit = fds.acquire_owned().await.map_err(|_| SorterError::Gone)?;
     // bounded: at most one owned operation per descriptor permit. Detaching
     // after caller cancellation is deliberate: its OS job is not cancellable.
     // It performs no subsequent producer work and retains all I/O reservations.
     tokio::spawn(async move {
+        let _metadata = metadata;
         let result = operation.await;
         drop(permit);
         drop(guard);
@@ -88,11 +104,17 @@ mod tests {
         let scope = Arc::new(IoScope::default());
         let (started, ready) = oneshot::channel();
         let (release, done) = oneshot::channel();
-        let task = tokio::spawn(perform(Arc::clone(&fds), Arc::clone(&scope), async move {
-            started.send(()).unwrap();
-            done.await.unwrap();
-            Ok(())
-        }));
+        let task = tokio::spawn(perform(
+            Arc::clone(&fds),
+            Arc::clone(&scope),
+            MemoryBudget::new(16384),
+            0,
+            async move {
+                started.send(()).unwrap();
+                done.await.unwrap();
+                Ok(())
+            },
+        ));
         ready.await.unwrap();
         task.abort();
         assert!(task.await.unwrap_err().is_cancelled());

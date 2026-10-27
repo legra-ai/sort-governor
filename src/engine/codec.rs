@@ -44,7 +44,7 @@ pub(crate) fn encode<T: Serialize>(
     };
     ciborium::ser::into_writer(value, &mut count)
         .map_err(|error| SorterError::Encode(error.to_string()))?;
-    let charge = budget.reserve(count.bytes)?;
+    let charge = budget.reserve_frame(count.bytes)?;
     let mut writer = FrameWriter {
         bytes: Vec::with_capacity(count.bytes),
         limit: count.bytes,

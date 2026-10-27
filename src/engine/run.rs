@@ -44,12 +44,18 @@ impl RunWriter {
         io: Arc<IoScope>,
     ) -> Result<Self, SorterError> {
         let output = path.clone();
-        perform(Arc::clone(&fds), Arc::clone(&io), async move {
-            let mut file = AsyncFile::create(&output).await?;
-            file.write_all(&0u64.to_le_bytes()).await?;
-            file.flush().await?;
-            Ok(())
-        })
+        perform(
+            Arc::clone(&fds),
+            Arc::clone(&io),
+            Arc::clone(&budget),
+            output.capacity(),
+            async move {
+                let mut file = AsyncFile::create(&output).await?;
+                file.write_all(&0u64.to_le_bytes()).await?;
+                file.flush().await?;
+                Ok(())
+            },
+        )
         .await?;
         Ok(Self {
             fds,
@@ -69,15 +75,21 @@ impl RunWriter {
             u32::try_from(bytes.len()).map_err(|error| SorterError::Encode(error.to_string()))?;
         let weight = u64::try_from(row.retained_bytes).map_err(|_| SorterError::RunLimit)?;
         let path = self.path.clone();
-        perform(Arc::clone(&self.fds), Arc::clone(&self.io), async move {
-            let _charge = charge;
-            let mut file = AsyncFile::open_append(&path).await?;
-            file.write_all(&len.to_le_bytes()).await?;
-            file.write_all(&weight.to_le_bytes()).await?;
-            file.write_all(&bytes).await?;
-            file.flush().await?;
-            Ok(())
-        })
+        perform(
+            Arc::clone(&self.fds),
+            Arc::clone(&self.io),
+            Arc::clone(&self.budget),
+            path.capacity(),
+            async move {
+                let _charge = charge;
+                let mut file = AsyncFile::open_append(&path).await?;
+                file.write_all(&len.to_le_bytes()).await?;
+                file.write_all(&weight.to_le_bytes()).await?;
+                file.write_all(&bytes).await?;
+                file.flush().await?;
+                Ok(())
+            },
+        )
         .await?;
         self.count = self.count.checked_add(1).ok_or(SorterError::RunLimit)?;
         Ok(())
@@ -86,13 +98,19 @@ impl RunWriter {
     pub(crate) async fn finish(self) -> Result<PathBuf, SorterError> {
         let path = self.path.clone();
         let count = self.count;
-        perform(self.fds, self.io, async move {
-            let mut file = AsyncFile::open_write_at_end(&path).await?;
-            file.seek(SeekFrom::Start(0)).await?;
-            file.write_all(&count.to_le_bytes()).await?;
-            file.flush().await?;
-            Ok(())
-        })
+        perform(
+            self.fds,
+            self.io,
+            Arc::clone(&self.budget),
+            path.capacity(),
+            async move {
+                let mut file = AsyncFile::open_write_at_end(&path).await?;
+                file.seek(SeekFrom::Start(0)).await?;
+                file.write_all(&count.to_le_bytes()).await?;
+                file.flush().await?;
+                Ok(())
+            },
+        )
         .await?;
         Ok(self.path)
     }
@@ -123,12 +141,18 @@ impl<K: DeserializeOwned, V: DeserializeOwned> RunReader<K, V> {
         io: Arc<IoScope>,
     ) -> Result<Self, SorterError> {
         let input = path.to_path_buf();
-        let remaining = perform(Arc::clone(&fds), Arc::clone(&io), async move {
-            let mut file = AsyncFile::open(&input).await?;
-            let mut count = [0; 8];
-            file.read_exact(&mut count).await?;
-            Ok(u64::from_le_bytes(count))
-        })
+        let remaining = perform(
+            Arc::clone(&fds),
+            Arc::clone(&io),
+            Arc::clone(&budget),
+            input.capacity(),
+            async move {
+                let mut file = AsyncFile::open(&input).await?;
+                let mut count = [0; 8];
+                file.read_exact(&mut count).await?;
+                Ok(u64::from_le_bytes(count))
+            },
+        )
         .await?;
         Ok(Self::from_position(path, 8, remaining, fds, budget, io))
     }
@@ -164,28 +188,34 @@ impl<K: DeserializeOwned, V: DeserializeOwned> RunReader<K, V> {
         let offset = self.offset;
         let budget = Arc::clone(&self.budget);
         let row_inline = std::mem::size_of::<RunRow<K, V>>();
-        let frame = perform(Arc::clone(&self.fds), Arc::clone(&self.io), async move {
-            let mut file = AsyncFile::open(&path).await?;
-            file.seek(SeekFrom::Start(offset)).await?;
-            let mut length = [0; 4];
-            let mut weight = [0; 8];
-            file.read_exact(&mut length).await?;
-            file.read_exact(&mut weight).await?;
-            let len =
-                usize::try_from(u32::from_le_bytes(length)).map_err(|_| SorterError::RunLimit)?;
-            let retained_bytes =
-                usize::try_from(u64::from_le_bytes(weight)).map_err(|_| SorterError::RunLimit)?;
-            let row_charge = budget.reserve(retained_bytes.max(row_inline))?;
-            let frame_charge = budget.reserve(len)?;
-            let mut bytes = vec![0; len];
-            file.read_exact(&mut bytes).await?;
-            Ok(Frame {
-                bytes,
-                retained_bytes,
-                row_charge,
-                _frame_charge: frame_charge,
-            })
-        })
+        let frame = perform(
+            Arc::clone(&self.fds),
+            Arc::clone(&self.io),
+            Arc::clone(&self.budget),
+            path.capacity(),
+            async move {
+                let mut file = AsyncFile::open(&path).await?;
+                file.seek(SeekFrom::Start(offset)).await?;
+                let mut length = [0; 4];
+                let mut weight = [0; 8];
+                file.read_exact(&mut length).await?;
+                file.read_exact(&mut weight).await?;
+                let len = usize::try_from(u32::from_le_bytes(length))
+                    .map_err(|_| SorterError::RunLimit)?;
+                let retained_bytes = usize::try_from(u64::from_le_bytes(weight))
+                    .map_err(|_| SorterError::RunLimit)?;
+                let row_charge = budget.reserve(retained_bytes.max(row_inline))?;
+                let frame_charge = budget.reserve_frame(len)?;
+                let mut bytes = vec![0; len];
+                file.read_exact(&mut bytes).await?;
+                Ok(Frame {
+                    bytes,
+                    retained_bytes,
+                    row_charge,
+                    _frame_charge: frame_charge,
+                })
+            },
+        )
         .await?;
         let mut row: RunRow<K, V> =
             ciborium::de::from_reader(frame.bytes.as_slice()).map_err(|error| {
