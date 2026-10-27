@@ -131,3 +131,56 @@ async fn corrupt_frame_lengths_are_rejected_before_allocation_and_do_not_advance
     drop((cursor, replay));
     root.remove().await.unwrap();
 }
+
+#[test]
+fn pending_cleanup_keeps_its_memory_reservation_until_filesystem_completion() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .max_blocking_threads(1)
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let root = async_fs_io::TempDir::create(std::env::temp_dir())
+            .await
+            .unwrap();
+        let governor = crate::SorterHandle::spawn(
+            crate::SorterConfig::default(),
+            6,
+            std::sync::Arc::new(crate::StaticPressure::new(1024 * 1024, 0)),
+            root.path().join("cleanup"),
+        );
+        // bounded: exactly eight independently owned replay scratch directories.
+        let mut replays = Vec::with_capacity(8);
+        for value in 0..8u32 {
+            let mut writer = governor.replay_writer::<u32>().await.unwrap();
+            writer.append_with_size(value, 4).await.unwrap();
+            replays.push(writer.seal().await.unwrap());
+        }
+        let reserved = governor.stats().await.unwrap().memory_bytes_used;
+        assert!(reserved > 0);
+        let (ready, started) = oneshot::channel();
+        let (release, gate) = mpsc::channel();
+        let os_worker = tokio::task::spawn_blocking(move || {
+            ready.send(()).unwrap();
+            let _ = gate.recv();
+        });
+        started.await.unwrap();
+        drop(replays);
+        tokio::task::yield_now().await;
+        assert_eq!(
+            governor.stats().await.unwrap().memory_bytes_used,
+            reserved,
+            "queued cleanup paths and worker state remain retained until OS completion"
+        );
+        release.send(()).unwrap();
+        os_worker.await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while governor.stats().await.unwrap().memory_bytes_used != 0 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .unwrap();
+        root.remove().await.unwrap();
+    });
+}

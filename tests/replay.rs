@@ -85,7 +85,13 @@ async fn replay_growth_keeps_resident_reservations_constant() {
     }
     assert!(cursor.next().await.unwrap().is_none());
     drop((cursor, replay));
-    assert_eq!(governor.stats().await.unwrap().memory_bytes_used, 0);
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while governor.stats().await.unwrap().memory_bytes_used != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
     root.remove().await.unwrap();
 }
 
@@ -144,5 +150,40 @@ async fn nested_sorted_and_replayed_inputs_share_one_real_descriptor() {
     }
     assert!(output.next().await.is_none());
     drop((checkpoint, replay, output, sorted));
+    root.remove().await.unwrap();
+}
+
+#[tokio::test]
+async fn independent_governors_never_reuse_a_live_scratch_identity() {
+    let root = async_fs_io::TempDir::create(std::env::temp_dir())
+        .await
+        .unwrap();
+    let pressure = Arc::new(StaticPressure::new(1024 * 1024, 0));
+    let first = SorterHandle::spawn(
+        SorterConfig::default(),
+        6,
+        pressure.clone(),
+        root.path().to_path_buf(),
+    );
+    let second = SorterHandle::spawn(
+        SorterConfig::default(),
+        6,
+        pressure,
+        root.path().to_path_buf(),
+    );
+    let left = first
+        .submit(sort_governor::SortSpec::new(0, 0))
+        .await
+        .unwrap();
+    let right = second
+        .submit(sort_governor::SortSpec::new(0, 0))
+        .await
+        .unwrap();
+    assert_ne!(
+        left.scratch_dir(),
+        right.scratch_dir(),
+        "scratch identity must survive independent governor lifetimes"
+    );
+    drop((left, right));
     root.remove().await.unwrap();
 }

@@ -10,6 +10,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use crate::engine::budget::MemoryCharge;
 use crate::engine::operation::IoScope;
 use crate::error::SorterError;
 
@@ -18,6 +19,7 @@ use crate::error::SorterError;
 pub(crate) struct AsyncCleanupGuard {
     dir: Option<PathBuf>,
     scope: Arc<IoScope>,
+    reservation: Option<MemoryCharge>,
 }
 
 impl AsyncCleanupGuard {
@@ -28,6 +30,18 @@ impl AsyncCleanupGuard {
 
     pub(crate) fn scope(&self) -> Arc<IoScope> {
         Arc::clone(&self.scope)
+    }
+
+    pub(crate) fn retain(&mut self, reservation: MemoryCharge) {
+        assert!(
+            self.reservation.is_none(),
+            "scratch reservation is assigned once"
+        );
+        self.reservation = Some(reservation);
+    }
+
+    pub(crate) fn take_reservation(&mut self) -> Option<MemoryCharge> {
+        self.reservation.take()
     }
 
     /// Point the guard at the scratch directory it must remove. Arming an
@@ -46,6 +60,7 @@ impl AsyncCleanupGuard {
         self.scope.idle().await;
         async_fs_io::remove_dir_all(dir).await?;
         self.dir = None;
+        self.reservation = None;
         Ok(())
     }
 }
@@ -63,7 +78,9 @@ impl Drop for AsyncCleanupGuard {
             return;
         };
         let scope = Arc::clone(&self.scope);
+        let reservation = self.reservation.take();
         handle.spawn(async move {
+            let _reservation = reservation;
             scope.idle().await;
             if let Err(err) = async_fs_io::remove_dir_all(&dir).await {
                 tracing::error!(dir = %dir.display(), error = %err, "sort scratch cleanup failed");

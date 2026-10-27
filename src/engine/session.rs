@@ -29,6 +29,8 @@ use crate::engine::run::RunWriter;
 use crate::error::SorterError;
 use crate::plan::SortPlan;
 
+mod buffer;
+
 #[cfg(test)]
 mod tests;
 
@@ -38,7 +40,7 @@ pub struct SortSession<K, V> {
     fds: Arc<Semaphore>,
     budget: Arc<MemoryBudget>,
     buffer_charge: Option<MemoryCharge>,
-    metadata_charge: Option<MemoryCharge>,
+    metadata_reserved: bool,
     next_row: u64,
     dir: PathBuf,
     dedup: bool,
@@ -70,7 +72,7 @@ where
             plan,
             budget: MemoryBudget::new(256 * 1024 * 1024),
             buffer_charge: None,
-            metadata_charge: None,
+            metadata_reserved: false,
             next_row: 0,
             fds: Arc::new(Semaphore::new(match plan {
                 SortPlan::InMemory => 2,
@@ -116,58 +118,24 @@ where
         self
     }
 
-    fn reserve_metadata(&mut self) -> Result<(), SorterError> {
-        if self.metadata_charge.is_none() {
-            // bounded: 64 frontier paths and their maximum session-relative
-            // name, plus the fixed merge frontier and session struct itself.
-            let path_bytes = self
-                .dir
-                .capacity()
-                .checked_add(128)
-                .ok_or(SorterError::RunLimit)?;
-            let bytes = path_bytes
-                .checked_mul(256)
-                .and_then(|n| n.checked_add(std::mem::size_of::<Self>()))
-                .ok_or(SorterError::RunLimit)?;
-            self.metadata_charge = Some(self.budget.reserve(bytes)?);
-        }
-        Ok(())
-    }
-
-    fn grow_buffer(&mut self) -> Result<(), SorterError> {
-        if self.buffer.len() < self.buffer.capacity() {
-            return Ok(());
-        }
-        let capacity = self
-            .buffer
-            .capacity()
-            .max(1)
-            .checked_mul(2)
-            .ok_or(SorterError::RunLimit)?;
-        let bytes = capacity
-            .checked_mul(std::mem::size_of::<RunRow<K, V>>())
-            .ok_or(SorterError::RunLimit)?;
-        let charge = self.budget.reserve(bytes)?;
-        self.buffer.reserve_exact(capacity - self.buffer.len());
-        assert_eq!(
-            self.buffer.capacity(),
-            capacity,
-            "exact row capacity reservation"
+    /// Set an explicit local byte cap before pushing rows. Process-governed
+    /// sessions already share a cap and should keep their injected budget.
+    ///
+    /// # Panics
+    /// Panics for a process-governed session or after any row/metadata
+    /// admission.
+    #[must_use]
+    pub fn with_memory_limit_bytes(mut self, bytes: u64) -> Self {
+        assert!(
+            !self.budget.is_governed(),
+            "cannot replace the process-governed memory budget"
         );
-        self.buffer_charge = Some(charge);
-        Ok(())
-    }
-
-    fn buffer_limit(&self) -> usize {
-        let shared = usize::try_from(self.budget.limit() / 8)
-            .unwrap_or(usize::MAX)
-            .max(1);
-        match self.plan {
-            SortPlan::InMemory => shared.min(8 * 1024 * 1024),
-            SortPlan::External {
-                run_buffer_bytes, ..
-            } => shared.min(run_buffer_bytes.max(1)),
-        }
+        assert!(
+            self.next_row == 0 && !self.metadata_reserved,
+            "memory cap is configured before ingestion"
+        );
+        self.budget = MemoryBudget::new(bytes);
+        self
     }
 
     /// The unique scratch directory this sort spills into (created lazily on
@@ -253,8 +221,7 @@ where
         if !self.buffer.is_empty() {
             self.spill().await?;
         }
-        let hold: Option<Box<dyn Send>> =
-            Some(Box::new((self.hold.take(), self.metadata_charge.take())));
+        let hold: Option<Box<dyn Send>> = self.hold.take();
         let guard = std::mem::take(&mut self.cleanup);
         // bounded: at most 64 frontier entries. Reverse levels to preserve
         // chronological run order, including the first row among equal keys.
@@ -286,7 +253,7 @@ where
         let rows = std::mem::take(&mut self.buffer).into_iter();
         let hold = self.hold.take();
         let allocation = self.buffer_charge.take();
-        let metadata = self.metadata_charge.take();
+        let metadata = self.cleanup.take_reservation();
         let dedup = self.dedup;
         Box::pin(stream::unfold(
             (rows, None, hold, allocation, metadata),

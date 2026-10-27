@@ -11,10 +11,7 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tokio::sync::Semaphore;
 
-use crate::engine::budget::{
-    MemoryBudget,
-    MemoryCharge,
-};
+use crate::engine::budget::MemoryBudget;
 use crate::engine::cleanup::AsyncCleanupGuard;
 use crate::engine::row::RunRow;
 use crate::engine::run::{
@@ -31,7 +28,6 @@ pub struct ReplayWriter<V> {
     writer: Option<RunWriter>,
     fds: Arc<Semaphore>,
     budget: Arc<MemoryBudget>,
-    metadata: Option<MemoryCharge>,
     cleanup: AsyncCleanupGuard,
     lease: Option<SortLease>,
     rows: u64,
@@ -51,7 +47,6 @@ impl<V: Serialize + DeserializeOwned + Send + 'static> ReplayWriter<V> {
             writer: None,
             fds,
             budget,
-            metadata: None,
             cleanup: AsyncCleanupGuard::disarmed(),
             lease,
             rows: 0,
@@ -85,7 +80,13 @@ impl<V: Serialize + DeserializeOwned + Send + 'static> ReplayWriter<V> {
                 bytes.checked_add(std::mem::size_of::<Self>() + std::mem::size_of::<ReplayInner>())
             })
             .ok_or(SorterError::RunLimit)?;
-        self.metadata = Some(self.budget.reserve(metadata_bytes)?);
+        self.cleanup.retain(
+            self.budget.reserve(
+                metadata_bytes
+                    .checked_add(4096)
+                    .ok_or(SorterError::RunLimit)?,
+            )?,
+        );
         self.cleanup.arm(self.dir.clone());
         let directory = self.dir.clone();
         crate::engine::operation::perform(
@@ -172,7 +173,6 @@ impl<V: Serialize + DeserializeOwned + Send + 'static> ReplayWriter<V> {
                 rows: self.rows,
                 fds: self.fds,
                 budget: self.budget,
-                _metadata: self.metadata,
                 cleanup: self.cleanup,
                 _lease: self.lease,
             }),
@@ -186,7 +186,6 @@ struct ReplayInner {
     rows: u64,
     fds: Arc<Semaphore>,
     budget: Arc<MemoryBudget>,
-    _metadata: Option<MemoryCharge>,
     cleanup: AsyncCleanupGuard,
     _lease: Option<SortLease>,
 }

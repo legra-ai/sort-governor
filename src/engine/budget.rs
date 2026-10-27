@@ -7,10 +7,11 @@ use std::sync::atomic::{
 };
 
 use crate::error::SorterError;
+use crate::service::MemoryPressure;
 
-#[derive(Debug)]
 pub(crate) struct MemoryBudget {
     limit: u64,
+    pressure: Option<Arc<dyn MemoryPressure>>,
     used: AtomicU64,
     peak: AtomicU64,
 }
@@ -19,13 +20,33 @@ impl MemoryBudget {
     pub(crate) fn new(limit: u64) -> Arc<Self> {
         Arc::new(Self {
             limit,
+            pressure: None,
             used: AtomicU64::new(0),
             peak: AtomicU64::new(0),
         })
     }
 
+    pub(crate) fn governed(limit: u64, pressure: Arc<dyn MemoryPressure>) -> Arc<Self> {
+        Arc::new(Self {
+            limit,
+            pressure: Some(pressure),
+            used: AtomicU64::new(0),
+            peak: AtomicU64::new(0),
+        })
+    }
+
+    pub(crate) fn is_governed(&self) -> bool {
+        self.pressure.is_some()
+    }
+
     pub(crate) fn limit(&self) -> u64 {
-        self.limit
+        self.pressure.as_ref().map_or(self.limit, |pressure| {
+            self.limit.min(
+                pressure
+                    .effective_target_bytes()
+                    .saturating_sub(pressure.resident_bytes()),
+            )
+        })
     }
     pub(crate) fn used(&self) -> u64 {
         self.used.load(Ordering::Acquire)
@@ -52,13 +73,11 @@ impl MemoryBudget {
         let bytes = u64::try_from(bytes).map_err(|_| SorterError::RunLimit)?;
         let mut previous = self.used();
         loop {
-            let Some(next) = previous
-                .checked_add(bytes)
-                .filter(|next| *next <= self.limit)
-            else {
+            let limit = self.limit();
+            let Some(next) = previous.checked_add(bytes).filter(|next| *next <= limit) else {
                 return Err(SorterError::MemoryBudget {
                     requested: bytes,
-                    available: self.limit.saturating_sub(previous),
+                    available: limit.saturating_sub(previous),
                 });
             };
             match self.used.compare_exchange_weak(
@@ -105,5 +124,15 @@ impl RunResources {
         io: Arc<crate::engine::operation::IoScope>,
     ) -> Self {
         Self { fds, memory, io }
+    }
+}
+
+impl std::fmt::Debug for MemoryBudget {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("MemoryBudget")
+            .field("admission_limit", &self.limit())
+            .field("used", &self.used())
+            .finish()
     }
 }

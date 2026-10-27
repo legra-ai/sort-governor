@@ -95,11 +95,13 @@ Actual retained-byte thresholds apply to both plans: underestimation cannot
 leave an unbounded in-memory relation. Stable ordinal tie-breaking permits an
 in-place unstable sort without allocating another run-sized sorting buffer.
 
-At governor creation, the shared byte ceiling is the smaller of the configured
-maximum run buffer and the pressure source's available target. It is a hard
-reservation cap; later pressure readings still inform each new plan. This
-initial ceiling does not claim to dynamically reclaim another operator's live
-rows when an external memory target shrinks.
+Every new reservation uses the smaller of the configured maximum run buffer
+and the pressure source's currently observed available target. Existing owned
+rows are not magically reclaimed when the target shrinks; new allocations fail
+until enough reservations are released. Deferred cleanup keeps its metadata
+reservation until its filesystem work completes, bounding the cleanup backlog
+with the same byte budget. Scratch identities are unique across governor
+lifetimes even when callers share a temporary root.
 
 `push_with_size` and `append_with_size` require the caller's actual retained
 key/value size, including owned capacities and nested data. Shared backing may

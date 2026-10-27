@@ -40,6 +40,7 @@ pub(crate) struct SorterActor {
     pressure: Arc<dyn MemoryPressure>,
     scratch_root: PathBuf,
     next_id: u64,
+    namespace: uuid::Uuid,
     in_memory_count: u64,
     external_count: u64,
 }
@@ -53,13 +54,8 @@ impl SorterActor {
         scratch_root: PathBuf,
     ) -> Self {
         let fd_total = fd_budget;
-        let limit = config.max_run_buffer_bytes().min(
-            pressure
-                .effective_target_bytes()
-                .saturating_sub(pressure.resident_bytes()),
-        );
         Self {
-            memory: MemoryBudget::new(limit),
+            memory: MemoryBudget::governed(config.max_run_buffer_bytes(), Arc::clone(&pressure)),
             config,
             fd_budget: Arc::new(Semaphore::new(fd_total as usize)),
             fd_total,
@@ -67,6 +63,7 @@ impl SorterActor {
             pressure,
             scratch_root,
             next_id: 0,
+            namespace: uuid::Uuid::new_v4(),
             in_memory_count: 0,
             external_count: 0,
         }
@@ -88,8 +85,14 @@ impl SorterActor {
         let snapshot = self.snapshot();
         let plan = SortPlanner::plan(spec, &snapshot, &self.config);
         let id = self.next_id;
-        self.next_id += 1;
-        let dir = self.scratch_root.join(format!("sort-{id:020}"));
+        let Some(next) = self.next_id.checked_add(1) else {
+            let _ = reply.send(Err(SorterError::RunLimit));
+            return;
+        };
+        self.next_id = next;
+        let dir = self
+            .scratch_root
+            .join(format!("sort-{}-{id:020}", self.namespace));
         match plan {
             SortPlan::InMemory => {
                 self.in_memory_count += 1;

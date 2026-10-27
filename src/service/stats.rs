@@ -17,6 +17,7 @@ pub struct SorterStats {
     pub memory_bytes_used: u64,
     /// Highest simultaneously reserved byte count since governor creation.
     pub memory_bytes_peak: u64,
-    /// Hard aggregate reservation ceiling shared by every admitted session.
+    /// Current admission ceiling. Shrinking pressure does not revoke existing
+    /// charges.
     pub memory_bytes_limit: u64,
 }
