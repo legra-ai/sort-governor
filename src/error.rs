@@ -19,6 +19,14 @@ pub enum SorterError {
     /// An earlier spill failed or was cancelled, invalidating this session.
     #[error("sort session cannot continue after a failed or cancelled spill")]
     SessionFailed,
+    /// A row or codec allocation cannot fit the remaining governed bytes.
+    #[error("sort memory budget exceeded: requested {requested} bytes with {available} available")]
+    MemoryBudget {
+        /// Bytes needed for this allocation.
+        requested: u64,
+        /// Unreserved bytes remaining in the shared budget.
+        available: u64,
+    },
     /// The governor actor is no longer running (its task ended or every
     /// handle was dropped), so the sort could not be admitted.
     #[error("sort governor is not running")]

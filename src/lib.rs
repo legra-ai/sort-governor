@@ -9,7 +9,12 @@ mod snapshot;
 mod spec;
 
 pub use config::SorterConfig;
-pub use engine::SortSession;
+pub use engine::{
+    Replay,
+    ReplayCursor,
+    ReplayWriter,
+    SortSession,
+};
 pub use error::SorterError;
 pub use plan::{
     SortPlan,

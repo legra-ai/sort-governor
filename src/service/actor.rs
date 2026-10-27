@@ -17,6 +17,7 @@ use tokio::sync::{
 };
 
 use crate::config::SorterConfig;
+use crate::engine::budget::MemoryBudget;
 use crate::error::SorterError;
 use crate::plan::{
     SortPlan,
@@ -34,6 +35,7 @@ pub(crate) struct SorterActor {
     config: SorterConfig,
     fd_budget: Arc<Semaphore>,
     fd_total: u32,
+    memory: Arc<MemoryBudget>,
     active: Arc<AtomicU32>,
     pressure: Arc<dyn MemoryPressure>,
     scratch_root: PathBuf,
@@ -52,7 +54,13 @@ impl SorterActor {
         scratch_root: PathBuf,
     ) -> Self {
         let fd_total = fd_budget.max(2);
+        let limit = config.max_run_buffer_bytes().min(
+            pressure
+                .effective_target_bytes()
+                .saturating_sub(pressure.resident_bytes()),
+        );
         Self {
+            memory: MemoryBudget::new(limit),
             config,
             fd_budget: Arc::new(Semaphore::new(fd_total as usize)),
             fd_total,
@@ -90,6 +98,7 @@ impl SorterActor {
                     plan,
                     dir,
                     Arc::clone(&self.fd_budget),
+                    Arc::clone(&self.memory),
                 )));
             }
             SortPlan::External { .. } => {
@@ -99,6 +108,7 @@ impl SorterActor {
                     plan,
                     dir,
                     Arc::clone(&self.fd_budget),
+                    Arc::clone(&self.memory),
                     Arc::clone(&self.active),
                 );
                 let _ = reply.send(Ok(lease));
@@ -129,6 +139,9 @@ impl SorterActor {
             active_external_sorts: self.active.load(Ordering::Relaxed),
             fd_permits_available: self.available_fd_permits(),
             fd_permits_total: self.fd_total,
+            memory_bytes_used: self.memory.used(),
+            memory_bytes_peak: self.memory.peak(),
+            memory_bytes_limit: self.memory.limit(),
         }
     }
 }

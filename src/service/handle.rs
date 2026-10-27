@@ -4,12 +4,15 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use serde::Serialize;
+use serde::de::DeserializeOwned;
 use tokio::sync::{
     mpsc,
     oneshot,
 };
 
 use crate::config::SorterConfig;
+use crate::engine::ReplayWriter;
 use crate::error::SorterError;
 use crate::service::actor::SorterActor;
 use crate::service::command::SorterCommand;
@@ -60,6 +63,20 @@ impl SorterHandle {
             .await
             .map_err(|_| SorterError::Gone)?;
         rx.await.map_err(|_| SorterError::Gone)?
+    }
+
+    /// Open a sequential replay sink sharing this governor's memory and I/O
+    /// budgets. The sink creates its scratch lazily on the first append/seal.
+    ///
+    /// # Errors
+    /// Returns [`SorterError::Gone`] if the governor has stopped.
+    pub async fn replay_writer<V: Serialize + DeserializeOwned + Send + 'static>(
+        &self,
+    ) -> Result<ReplayWriter<V>, SorterError> {
+        Ok(self
+            .submit(SortSpec::new(0, 0).labelled("replay"))
+            .await?
+            .into_replay_writer())
     }
 
     /// Read the governor's current counters.

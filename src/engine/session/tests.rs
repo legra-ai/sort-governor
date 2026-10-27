@@ -123,3 +123,30 @@ async fn failed_spill_cannot_be_retried_or_finished() {
     );
     root.remove().await.expect("cleanup");
 }
+
+#[tokio::test]
+async fn underestimated_in_memory_input_spills_at_the_runtime_byte_limit() {
+    let mut session = SortSession::with_temp_dir(SortPlan::InMemory, &std::env::temp_dir(), false);
+    // bounded: 144 fixed 64KiB records exceed the 8MiB adaptive threshold.
+    for key in (0..144u32).rev() {
+        session
+            .push_with_size(
+                key,
+                vec![u8::try_from(key).unwrap(); 64 * 1024],
+                64 * 1024 + 64,
+            )
+            .await
+            .unwrap();
+    }
+    assert!(
+        session.next_run > 0,
+        "an underestimated plan must spill actual bytes"
+    );
+    let mut stream = session.finish().await.unwrap();
+    for key in 0..144u32 {
+        let value = stream.next().await.unwrap().unwrap();
+        assert_eq!(value.len(), 64 * 1024);
+        assert!(value.iter().all(|byte| *byte == u8::try_from(key).unwrap()));
+    }
+    assert!(stream.next().await.is_none());
+}

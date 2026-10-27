@@ -14,7 +14,11 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tokio::sync::Semaphore;
 
-use crate::engine::SortSession;
+use crate::engine::budget::MemoryBudget;
+use crate::engine::{
+    ReplayWriter,
+    SortSession,
+};
 use crate::plan::SortPlan;
 
 /// Decrements the active-sort counter when its lease is dropped.
@@ -39,16 +43,23 @@ pub struct SortLease {
     plan: SortPlan,
     scratch_dir: PathBuf,
     fds: Arc<Semaphore>,
+    memory: Arc<MemoryBudget>,
     _active: Option<ActiveGuard>,
 }
 
 impl SortLease {
     /// An in-memory lease: no fd permits, no concurrency slot.
-    pub(crate) fn in_memory(plan: SortPlan, scratch_dir: PathBuf, fds: Arc<Semaphore>) -> Self {
+    pub(crate) fn in_memory(
+        plan: SortPlan,
+        scratch_dir: PathBuf,
+        fds: Arc<Semaphore>,
+        memory: Arc<MemoryBudget>,
+    ) -> Self {
         Self {
             plan,
             scratch_dir,
             fds,
+            memory,
             _active: None,
         }
     }
@@ -58,14 +69,27 @@ impl SortLease {
         plan: SortPlan,
         scratch_dir: PathBuf,
         fds: Arc<Semaphore>,
+        memory: Arc<MemoryBudget>,
         active: Arc<AtomicU32>,
     ) -> Self {
         Self {
             plan,
             scratch_dir,
             fds,
+            memory,
             _active: Some(ActiveGuard { active }),
         }
+    }
+
+    pub(crate) fn into_replay_writer<V: Serialize + DeserializeOwned + Send + 'static>(
+        self,
+    ) -> ReplayWriter<V> {
+        ReplayWriter::new(
+            self.scratch_dir.clone(),
+            Arc::clone(&self.fds),
+            Arc::clone(&self.memory),
+            Some(self),
+        )
     }
 
     /// The plan chosen for this sort.
@@ -93,6 +117,7 @@ impl SortLease {
         let dir = self.scratch_dir.clone();
         SortSession::new(plan, dir, dedup)
             .with_fd_budget(Arc::clone(&self.fds))
+            .with_memory_budget(Arc::clone(&self.memory))
             .hold_resource(Box::new(self))
     }
 }

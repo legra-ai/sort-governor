@@ -22,6 +22,8 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tokio::sync::Semaphore;
 
+use crate::engine::budget::MemoryBudget;
+use crate::engine::codec;
 use crate::engine::row::RunRow;
 use crate::error::SorterError;
 
@@ -30,13 +32,17 @@ pub(crate) struct RunWriter {
     fds: Arc<Semaphore>,
     path: PathBuf,
     count: u64,
-    /// Encode buffer reused across rows so a spill allocates once, not per row.
-    scratch: Vec<u8>,
+    /// Shared budget charged before allocating each serialized frame.
+    budget: Arc<MemoryBudget>,
 }
 
 impl RunWriter {
     /// Create a fresh run file with a placeholder count header.
-    pub(crate) async fn create(path: PathBuf, fds: Arc<Semaphore>) -> Result<Self, SorterError> {
+    pub(crate) async fn create(
+        path: PathBuf,
+        fds: Arc<Semaphore>,
+        budget: Arc<MemoryBudget>,
+    ) -> Result<Self, SorterError> {
         let _permit = Arc::clone(&fds)
             .acquire_owned()
             .await
@@ -48,7 +54,7 @@ impl RunWriter {
             fds,
             path,
             count: 0,
-            scratch: Vec::new(),
+            budget,
         })
     }
 
@@ -58,20 +64,20 @@ impl RunWriter {
         K: Serialize,
         V: Serialize,
     {
-        self.scratch.clear();
-        ciborium::ser::into_writer(row, &mut self.scratch)
-            .map_err(|err| SorterError::Encode(err.to_string()))?;
-        let len = u32::try_from(self.scratch.len())
-            .map_err(|err| SorterError::Encode(format!("run row too large: {err}")))?;
+        let (bytes, _charge) = codec::encode(row, &self.budget)?;
+        let len =
+            u32::try_from(bytes.len()).map_err(|error| SorterError::Encode(error.to_string()))?;
         let _permit = Arc::clone(&self.fds)
             .acquire_owned()
             .await
             .map_err(|_| SorterError::Gone)?;
         let mut file = AsyncFile::open_append(&self.path).await?;
         file.write_all(&len.to_le_bytes()).await?;
-        file.write_all(&self.scratch).await?;
+        file.write_all(&(row.retained_bytes as u64).to_le_bytes())
+            .await?;
+        file.write_all(&bytes).await?;
         file.flush().await?;
-        self.count += 1;
+        self.count = self.count.checked_add(1).ok_or(SorterError::RunLimit)?;
         Ok(())
     }
 
@@ -95,8 +101,8 @@ pub(crate) struct RunReader<K, V> {
     path: PathBuf,
     offset: u64,
     remaining: u64,
-    /// Decode buffer reused across rows; it grows to the largest row seen.
-    buf: Vec<u8>,
+    /// Shared budget charged before reading and decoding each row.
+    budget: Arc<MemoryBudget>,
     _marker: std::marker::PhantomData<(K, V)>,
 }
 
@@ -106,7 +112,11 @@ where
     V: DeserializeOwned,
 {
     /// Open a run and read its row count.
-    pub(crate) async fn open(path: &Path, fds: Arc<Semaphore>) -> Result<Self, SorterError> {
+    pub(crate) async fn open(
+        path: &Path,
+        fds: Arc<Semaphore>,
+        budget: Arc<MemoryBudget>,
+    ) -> Result<Self, SorterError> {
         let _permit = Arc::clone(&fds)
             .acquire_owned()
             .await
@@ -119,9 +129,30 @@ where
             path: path.to_path_buf(),
             offset: 8,
             remaining: u64::from_le_bytes(header),
-            buf: Vec::new(),
+            budget,
             _marker: std::marker::PhantomData,
         })
+    }
+
+    pub(crate) fn from_position(
+        path: &Path,
+        offset: u64,
+        remaining: u64,
+        fds: Arc<Semaphore>,
+        budget: Arc<MemoryBudget>,
+    ) -> Self {
+        Self {
+            fds,
+            path: path.to_path_buf(),
+            offset,
+            remaining,
+            budget,
+            _marker: std::marker::PhantomData,
+        }
+    }
+
+    pub(crate) fn position(&self) -> (u64, u64) {
+        (self.offset, self.remaining)
     }
 
     /// Read the next row, or `None` at end of run.
@@ -139,14 +170,24 @@ where
         file.read_exact(&mut len_bytes).await?;
         let len = usize::try_from(u32::from_le_bytes(len_bytes))
             .map_err(|err| SorterError::Decode(format!("run row length overflow: {err}")))?;
-        self.buf.resize(len, 0);
-        file.read_exact(&mut self.buf).await?;
-        let row = ciborium::de::from_reader(self.buf.as_slice())
+        let mut weight = [0u8; 8];
+        file.read_exact(&mut weight).await?;
+        let retained_bytes =
+            usize::try_from(u64::from_le_bytes(weight)).map_err(|_| SorterError::RunLimit)?;
+        let row_charge = self
+            .budget
+            .reserve(retained_bytes.max(std::mem::size_of::<RunRow<K, V>>()))?;
+        let _frame_charge = self.budget.reserve(len)?;
+        let mut bytes = vec![0; len];
+        file.read_exact(&mut bytes).await?;
+        let mut row: RunRow<K, V> = ciborium::de::from_reader(bytes.as_slice())
             .map_err(|err| SorterError::Decode(format!("{err} (run {})", self.path.display())))?;
         self.offset = self
             .offset
-            .checked_add(4 + len as u64)
+            .checked_add(12 + len as u64)
             .ok_or(SorterError::RunLimit)?;
+        row.retained_bytes = retained_bytes;
+        row.charge = Some(row_charge);
         self.remaining -= 1;
         Ok(Some(row))
     }

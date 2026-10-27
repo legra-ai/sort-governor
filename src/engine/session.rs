@@ -13,6 +13,11 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tokio::sync::Semaphore;
 
+use crate::engine::budget::{
+    MemoryBudget,
+    MemoryCharge,
+    RunResources,
+};
 use crate::engine::cleanup::AsyncCleanupGuard;
 use crate::engine::merge::{
     ValueStream,
@@ -31,6 +36,10 @@ mod tests;
 pub struct SortSession<K, V> {
     plan: SortPlan,
     fds: Arc<Semaphore>,
+    budget: Arc<MemoryBudget>,
+    buffer_charge: Option<MemoryCharge>,
+    metadata_charge: Option<MemoryCharge>,
+    next_row: u64,
     dir: PathBuf,
     dedup: bool,
     buffer: Vec<RunRow<K, V>>,
@@ -59,6 +68,10 @@ where
     pub fn new(plan: SortPlan, dir: PathBuf, dedup: bool) -> Self {
         Self {
             plan,
+            budget: MemoryBudget::new(256 * 1024 * 1024),
+            buffer_charge: None,
+            metadata_charge: None,
+            next_row: 0,
             fds: Arc::new(Semaphore::new(match plan {
                 SortPlan::InMemory => 2,
                 SortPlan::External { max_fan_in, .. } => max_fan_in.max(2) as usize,
@@ -98,6 +111,65 @@ where
         self
     }
 
+    pub(crate) fn with_memory_budget(mut self, budget: Arc<MemoryBudget>) -> Self {
+        self.budget = budget;
+        self
+    }
+
+    fn reserve_metadata(&mut self) -> Result<(), SorterError> {
+        if self.metadata_charge.is_none() {
+            // bounded: 64 frontier paths and their maximum session-relative
+            // name, plus the fixed merge frontier and session struct itself.
+            let path_bytes = self
+                .dir
+                .capacity()
+                .checked_add(128)
+                .ok_or(SorterError::RunLimit)?;
+            let bytes = path_bytes
+                .checked_mul(256)
+                .and_then(|n| n.checked_add(std::mem::size_of::<Self>()))
+                .ok_or(SorterError::RunLimit)?;
+            self.metadata_charge = Some(self.budget.reserve(bytes)?);
+        }
+        Ok(())
+    }
+
+    fn grow_buffer(&mut self) -> Result<(), SorterError> {
+        if self.buffer.len() < self.buffer.capacity() {
+            return Ok(());
+        }
+        let capacity = self
+            .buffer
+            .capacity()
+            .max(1)
+            .checked_mul(2)
+            .ok_or(SorterError::RunLimit)?;
+        let bytes = capacity
+            .checked_mul(std::mem::size_of::<RunRow<K, V>>())
+            .ok_or(SorterError::RunLimit)?;
+        let charge = self.budget.reserve(bytes)?;
+        self.buffer.reserve_exact(capacity - self.buffer.len());
+        assert_eq!(
+            self.buffer.capacity(),
+            capacity,
+            "exact row capacity reservation"
+        );
+        self.buffer_charge = Some(charge);
+        Ok(())
+    }
+
+    fn buffer_limit(&self) -> usize {
+        let shared = usize::try_from(self.budget.limit() / 8)
+            .unwrap_or(usize::MAX)
+            .max(1);
+        match self.plan {
+            SortPlan::InMemory => shared.min(8 * 1024 * 1024),
+            SortPlan::External {
+                run_buffer_bytes, ..
+            } => shared.min(run_buffer_bytes.max(1)),
+        }
+    }
+
     /// The unique scratch directory this sort spills into (created lazily on
     /// the first spill, removed when the output stream is dropped).
     #[must_use]
@@ -105,8 +177,9 @@ where
         &self.dir
     }
 
-    /// Push one row, sized with a caller estimate. Spills the current run
-    /// first when adding this row would overflow the plan's run buffer.
+    /// Push one row with its retained key/value bytes, including owned heap
+    /// data. Spills the current run first when adding this row would
+    /// overflow the plan's run buffer.
     ///
     /// # Errors
     ///
@@ -120,21 +193,34 @@ where
         estimated_bytes: usize,
     ) -> Result<(), SorterError> {
         self.ensure_usable()?;
-        let bytes = estimated_bytes.max(1);
-        if let SortPlan::External {
-            run_buffer_bytes, ..
-        } = self.plan
-            && !self.buffer.is_empty()
-            && self.buffer_bytes.saturating_add(bytes) > run_buffer_bytes
+        self.reserve_metadata()?;
+        let bytes = estimated_bytes.max(std::mem::size_of::<RunRow<K, V>>());
+        let charge = self.budget.reserve(bytes)?;
+        if !self.buffer.is_empty()
+            && self
+                .buffer_bytes
+                .checked_add(bytes)
+                .is_none_or(|sum| sum > self.buffer_limit())
         {
             self.spill().await?;
         }
-        self.buffer.push(RunRow::new(key, value));
-        self.buffer_bytes = self.buffer_bytes.saturating_add(bytes);
+        self.grow_buffer()?;
+        let mut row = RunRow::new(key, value);
+        row.ordinal = self.next_row;
+        self.next_row = self.next_row.checked_add(1).ok_or(SorterError::RunLimit)?;
+        row.retained_bytes = bytes;
+        row.charge = Some(charge);
+        self.buffer.push(row);
+        self.buffer_bytes = self
+            .buffer_bytes
+            .checked_add(bytes)
+            .ok_or(SorterError::RunLimit)?;
         Ok(())
     }
 
-    /// Push one row using a conservative fixed size estimate.
+    /// Push one row whose key and value contain no owned heap allocations.
+    /// Heap-owning rows must use [`Self::push_with_size`] with their retained
+    /// size.
     ///
     /// # Errors
     ///
@@ -151,9 +237,14 @@ where
     /// Returns [`SorterError`] if a final spill or the merge setup fails.
     pub async fn finish(mut self) -> Result<ValueStream<V>, SorterError> {
         self.ensure_usable()?;
-        self.buffer.sort_by(|left, right| left.key.cmp(&right.key));
+        self.buffer.sort_unstable_by(|left, right| {
+            left.key
+                .cmp(&right.key)
+                .then(left.ordinal.cmp(&right.ordinal))
+        });
         let fan_in = match self.plan {
-            SortPlan::InMemory => return Ok(self.in_memory_stream()),
+            SortPlan::InMemory if self.next_run == 0 => return Ok(self.in_memory_stream()),
+            SortPlan::InMemory => 2,
             SortPlan::External { .. } if self.next_run == 0 => {
                 return Ok(self.in_memory_stream());
             }
@@ -162,7 +253,8 @@ where
         if !self.buffer.is_empty() {
             self.spill().await?;
         }
-        let hold = self.hold.take();
+        let hold: Option<Box<dyn Send>> =
+            Some(Box::new((self.hold.take(), self.metadata_charge.take())));
         let guard = std::mem::take(&mut self.cleanup);
         // bounded: at most 64 frontier entries. Reverse levels to preserve
         // chronological run order, including the first row among equal keys.
@@ -180,7 +272,7 @@ where
             guard,
             self.dedup,
             hold,
-            Arc::clone(&self.fds),
+            RunResources::new(Arc::clone(&self.fds), Arc::clone(&self.budget)),
         )
         .await
     }
@@ -190,22 +282,25 @@ where
     /// plan, so materializing its values here is safe. The resource hold
     /// rides the stream so its lease releases only when the stream ends.
     fn in_memory_stream(&mut self) -> ValueStream<V> {
-        let rows = std::mem::take(&mut self.buffer);
-        let mut values = Vec::with_capacity(rows.len());
-        let mut last: Option<K> = None;
-        for row in rows {
-            if self.dedup {
-                if last.as_ref() == Some(&row.key) {
-                    continue;
-                }
-                last = Some(row.key.clone());
-            }
-            values.push(row.value);
-        }
+        let rows = std::mem::take(&mut self.buffer).into_iter();
         let hold = self.hold.take();
+        let allocation = self.buffer_charge.take();
+        let metadata = self.metadata_charge.take();
+        let dedup = self.dedup;
         Box::pin(stream::unfold(
-            (values.into_iter(), hold),
-            |(mut values, hold)| async move { values.next().map(|value| (Ok(value), (values, hold))) },
+            (rows, None, hold, allocation, metadata),
+            move |(mut rows, mut last, hold, allocation, metadata)| async move {
+                for row in rows.by_ref() {
+                    if dedup && last.as_ref().is_some_and(|(key, _)| key == &row.key) {
+                        continue;
+                    }
+                    if dedup {
+                        last = Some((row.key, row.charge));
+                    }
+                    return Some((Ok(row.value), (rows, last, hold, allocation, metadata)));
+                }
+                None
+            },
         ))
     }
 
@@ -219,16 +314,22 @@ where
         self.failed = true;
         let ordinal = self.next_run;
         self.next_run = ordinal.checked_add(1).ok_or(SorterError::RunLimit)?;
-        self.buffer.sort_by(|left, right| left.key.cmp(&right.key));
+        self.buffer.sort_unstable_by(|left, right| {
+            left.key
+                .cmp(&right.key)
+                .then(left.ordinal.cmp(&right.ordinal))
+        });
         async_fs_io::ensure_dir(&self.dir).await?;
         self.cleanup.arm(self.dir.clone());
         let path = self.dir.join(format!("run-{ordinal:020}.cbor"));
-        let mut writer = RunWriter::create(path, Arc::clone(&self.fds)).await?;
+        let mut writer =
+            RunWriter::create(path, Arc::clone(&self.fds), Arc::clone(&self.budget)).await?;
         for row in &self.buffer {
             writer.write_row(row).await?;
         }
         let mut run = writer.finish().await?;
-        self.buffer.clear();
+        self.buffer = Vec::new();
+        self.buffer_charge = None;
         self.buffer_bytes = 0;
         for (level, slot) in self.spills.iter_mut().enumerate() {
             let Some(older) = slot.take() else {
@@ -240,8 +341,14 @@ where
                 .dir
                 .join(format!("carry-{ordinal:020}-{level:02}.cbor"));
             // bounded: two adjacent runs, older first for stable equal keys.
-            run = merge_group_to_file::<K, V>(&[older, run], output, false, Arc::clone(&self.fds))
-                .await?;
+            run = merge_group_to_file::<K, V>(
+                &[older, run],
+                output,
+                false,
+                Arc::clone(&self.fds),
+                Arc::clone(&self.budget),
+            )
+            .await?;
         }
         unreachable!("a checked u64 spill count always fits in 64 frontier levels")
     }

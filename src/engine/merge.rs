@@ -24,6 +24,11 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tokio::sync::Semaphore;
 
+use crate::engine::budget::{
+    MemoryBudget,
+    MemoryCharge,
+    RunResources,
+};
 use crate::engine::cleanup::AsyncCleanupGuard;
 use crate::engine::row::RunRow;
 use crate::engine::run::{
@@ -40,6 +45,7 @@ pub(crate) type ValueStream<V> = Pin<Box<dyn Stream<Item = Result<V, SorterError
 struct MergeSource<K, V> {
     head: Option<RunRow<K, V>>,
     reader: RunReader<K, V>,
+    key_charge: Option<MemoryCharge>,
 }
 
 impl<K, V> MergeSource<K, V>
@@ -48,12 +54,17 @@ where
     V: DeserializeOwned,
 {
     /// Open a run and buffer its first row. Returns `None` for an empty run.
-    async fn open(path: &Path, fds: Arc<Semaphore>) -> Result<Option<Self>, SorterError> {
-        let mut reader = RunReader::open(path, fds).await?;
+    async fn open(
+        path: &Path,
+        fds: Arc<Semaphore>,
+        budget: Arc<MemoryBudget>,
+    ) -> Result<Option<Self>, SorterError> {
+        let mut reader = RunReader::open(path, fds, budget).await?;
         match reader.next_row().await? {
             Some(head) => Ok(Some(Self {
                 head: Some(head),
                 reader,
+                key_charge: None,
             })),
             None => Ok(None),
         }
@@ -84,7 +95,8 @@ struct MergeState<K, V> {
     sources: Vec<MergeSource<K, V>>,
     heap: BinaryHeap<Reverse<HeapEntry<K>>>,
     dedup: bool,
-    last_key: Option<K>,
+    last_key: Option<(K, MemoryCharge)>,
+    budget: Arc<MemoryBudget>,
 }
 
 impl<K, V> MergeState<K, V>
@@ -92,22 +104,29 @@ where
     K: Ord + Clone + DeserializeOwned,
     V: DeserializeOwned,
 {
-    fn new(sources: Vec<MergeSource<K, V>>, dedup: bool) -> Self {
+    fn new(
+        mut sources: Vec<MergeSource<K, V>>,
+        dedup: bool,
+        budget: Arc<MemoryBudget>,
+    ) -> Result<Self, SorterError> {
         let mut heap = BinaryHeap::new();
-        for (idx, source) in sources.iter().enumerate() {
-            if let Some(key) = source.key() {
+        for (idx, source) in sources.iter_mut().enumerate() {
+            if let Some(head) = &source.head {
+                source.key_charge = Some(budget.reserve(head.retained_bytes)?);
+                let key = &head.key;
                 heap.push(Reverse(HeapEntry {
                     key: key.clone(),
                     idx,
                 }));
             }
         }
-        Self {
+        Ok(Self {
             sources,
             heap,
             dedup,
             last_key: None,
-        }
+            budget,
+        })
     }
 
     /// Emit the next row in key order, collapsing equal keys when `dedup`.
@@ -117,7 +136,12 @@ where
                 return Ok(None);
             };
             let idx = entry.idx;
+            drop(entry.key);
+            self.sources[idx].key_charge = None;
             let row = self.sources[idx].take_head().await?;
+            if let Some(head) = &self.sources[idx].head {
+                self.sources[idx].key_charge = Some(self.budget.reserve(head.retained_bytes)?);
+            }
             if let Some(key) = self.sources[idx].key() {
                 self.heap.push(Reverse(HeapEntry {
                     key: key.clone(),
@@ -125,10 +149,15 @@ where
                 }));
             }
             if self.dedup {
-                if self.last_key.as_ref() == Some(&row.key) {
+                if self
+                    .last_key
+                    .as_ref()
+                    .is_some_and(|(key, _)| key == &row.key)
+                {
                     continue;
                 }
-                self.last_key = Some(row.key.clone());
+                let charge = self.budget.reserve(row.retained_bytes)?;
+                self.last_key = Some((row.key.clone(), charge));
             }
             return Ok(Some(row));
         }
@@ -141,6 +170,7 @@ pub(crate) async fn merge_group_to_file<K, V>(
     out: PathBuf,
     dedup: bool,
     fds: Arc<Semaphore>,
+    budget: Arc<MemoryBudget>,
 ) -> Result<PathBuf, SorterError>
 where
     K: Ord + Clone + Serialize + DeserializeOwned,
@@ -149,12 +179,13 @@ where
     // bounded: two frontier inputs or a final-cascade group of at most fan_in.
     let mut sources: Vec<MergeSource<K, V>> = Vec::with_capacity(paths.len());
     for path in paths {
-        if let Some(source) = MergeSource::open(path, Arc::clone(&fds)).await? {
+        if let Some(source) = MergeSource::open(path, Arc::clone(&fds), Arc::clone(&budget)).await?
+        {
             sources.push(source);
         }
     }
-    let mut state = MergeState::new(sources, dedup);
-    let mut writer = RunWriter::create(out, Arc::clone(&fds)).await?;
+    let mut state = MergeState::new(sources, dedup, Arc::clone(&budget))?;
+    let mut writer = RunWriter::create(out, Arc::clone(&fds), Arc::clone(&budget)).await?;
     while let Some(row) = state.next_row().await? {
         writer.write_row(&row).await?;
     }
@@ -178,12 +209,16 @@ pub(crate) async fn cascade_and_stream<K, V>(
     guard: AsyncCleanupGuard,
     dedup: bool,
     hold: Option<Box<dyn Send>>,
-    fds: Arc<Semaphore>,
+    resources: RunResources,
 ) -> Result<ValueStream<V>, SorterError>
 where
     K: Ord + Clone + Serialize + DeserializeOwned + Send + 'static,
     V: Serialize + DeserializeOwned + Send + 'static,
 {
+    let RunResources {
+        fds,
+        memory: budget,
+    } = resources;
     let mut pass = 0u32;
     while runs.len() > fan_in {
         // bounded: the session hands over at most 64 frontier paths.
@@ -194,7 +229,16 @@ where
                 continue;
             }
             let out = dir.join(format!("merge-{pass:03}-{group_idx:05}.cbor"));
-            next.push(merge_group_to_file::<K, V>(group, out, false, Arc::clone(&fds)).await?);
+            next.push(
+                merge_group_to_file::<K, V>(
+                    group,
+                    out,
+                    false,
+                    Arc::clone(&fds),
+                    Arc::clone(&budget),
+                )
+                .await?,
+            );
         }
         runs = next;
         pass += 1;
@@ -202,11 +246,12 @@ where
     // bounded: the final cascade has reduced the frontier to at most fan_in.
     let mut sources: Vec<MergeSource<K, V>> = Vec::with_capacity(runs.len());
     for path in &runs {
-        if let Some(source) = MergeSource::open(path, Arc::clone(&fds)).await? {
+        if let Some(source) = MergeSource::open(path, Arc::clone(&fds), Arc::clone(&budget)).await?
+        {
             sources.push(source);
         }
     }
-    let state = MergeState::new(sources, dedup);
+    let state = MergeState::new(sources, dedup, Arc::clone(&budget))?;
     Ok(Box::pin(value_stream(state, guard, hold)))
 }
 
