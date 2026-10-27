@@ -265,6 +265,7 @@ where
             .filter_map(Option::take)
             .collect();
         let dir = self.dir.clone();
+        let io = guard.scope();
         cascade_and_stream::<K, V>(
             spills,
             fan_in.max(2),
@@ -272,7 +273,7 @@ where
             guard,
             self.dedup,
             hold,
-            RunResources::new(Arc::clone(&self.fds), Arc::clone(&self.budget)),
+            RunResources::new(Arc::clone(&self.fds), Arc::clone(&self.budget), io),
         )
         .await
     }
@@ -322,8 +323,13 @@ where
         async_fs_io::ensure_dir(&self.dir).await?;
         self.cleanup.arm(self.dir.clone());
         let path = self.dir.join(format!("run-{ordinal:020}.cbor"));
-        let mut writer =
-            RunWriter::create(path, Arc::clone(&self.fds), Arc::clone(&self.budget)).await?;
+        let mut writer = RunWriter::create(
+            path,
+            Arc::clone(&self.fds),
+            Arc::clone(&self.budget),
+            self.cleanup.scope(),
+        )
+        .await?;
         for row in &self.buffer {
             writer.write_row(row).await?;
         }
@@ -347,6 +353,7 @@ where
                 false,
                 Arc::clone(&self.fds),
                 Arc::clone(&self.budget),
+                self.cleanup.scope(),
             )
             .await?;
         }

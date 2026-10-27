@@ -1,0 +1,109 @@
+//! Ownership of inherently non-cancellable filesystem operations.
+//!
+//! Tokio filesystem futures can outlive their caller in the OS worker pool.
+//! Keep descriptor and frame reservations until that single operation finishes;
+//! a scratch guard waits only for operations belonging to its own directory.
+
+use std::future::Future;
+use std::sync::Arc;
+use std::sync::atomic::{
+    AtomicUsize,
+    Ordering,
+};
+
+use tokio::sync::{
+    Notify,
+    Semaphore,
+};
+
+use crate::error::SorterError;
+
+#[derive(Debug, Default)]
+pub(crate) struct IoScope {
+    pending: AtomicUsize,
+    changed: Notify,
+}
+
+impl IoScope {
+    fn start(self: &Arc<Self>) -> IoGuard {
+        self.pending.fetch_add(1, Ordering::AcqRel);
+        IoGuard(Arc::clone(self))
+    }
+
+    pub(crate) async fn idle(&self) {
+        loop {
+            let changed = self.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if self.pending.load(Ordering::Acquire) == 0 {
+                return;
+            }
+            changed.await;
+        }
+    }
+}
+
+struct IoGuard(Arc<IoScope>);
+impl Drop for IoGuard {
+    fn drop(&mut self) {
+        if self.0.pending.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.0.changed.notify_waiters();
+        }
+    }
+}
+
+pub(crate) async fn perform<T, F>(
+    fds: Arc<Semaphore>,
+    scope: Arc<IoScope>,
+    operation: F,
+) -> Result<T, SorterError>
+where
+    T: Send + 'static,
+    F: Future<Output = Result<T, SorterError>> + Send + 'static,
+{
+    let guard = scope.start();
+    let permit = fds.acquire_owned().await.map_err(|_| SorterError::Gone)?;
+    // bounded: at most one owned operation per descriptor permit. Detaching
+    // after caller cancellation is deliberate: its OS job is not cancellable.
+    // It performs no subsequent producer work and retains all I/O reservations.
+    tokio::spawn(async move {
+        let result = operation.await;
+        drop(permit);
+        drop(guard);
+        result
+    })
+    .await
+    .map_err(|error| SorterError::Worker(error.to_string()))?
+}
+
+#[cfg(test)]
+mod tests {
+    use tokio::sync::oneshot;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn cancelled_caller_keeps_operation_reservations_until_the_os_job_finishes() {
+        let fds = Arc::new(Semaphore::new(1));
+        let scope = Arc::new(IoScope::default());
+        let (started, ready) = oneshot::channel();
+        let (release, done) = oneshot::channel();
+        let task = tokio::spawn(perform(Arc::clone(&fds), Arc::clone(&scope), async move {
+            started.send(()).unwrap();
+            done.await.unwrap();
+            Ok(())
+        }));
+        ready.await.unwrap();
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert_eq!(
+            fds.available_permits(),
+            0,
+            "the OS job still owns its descriptor"
+        );
+        assert_eq!(scope.pending.load(Ordering::Acquire), 1);
+        release.send(()).unwrap();
+        scope.idle().await;
+        assert_eq!(fds.available_permits(), 1);
+    }
+}

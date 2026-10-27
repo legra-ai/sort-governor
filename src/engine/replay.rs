@@ -93,6 +93,7 @@ impl<V: Serialize + DeserializeOwned + Send + 'static> ReplayWriter<V> {
                 self.dir.join("rows.cbor"),
                 Arc::clone(&self.fds),
                 Arc::clone(&self.budget),
+                self.cleanup.scope(),
             )
             .await?,
         );
@@ -161,7 +162,7 @@ impl<V: Serialize + DeserializeOwned + Send + 'static> ReplayWriter<V> {
                 fds: self.fds,
                 budget: self.budget,
                 _metadata: self.metadata,
-                _cleanup: self.cleanup,
+                cleanup: self.cleanup,
                 _lease: self.lease,
             }),
             marker: PhantomData,
@@ -175,7 +176,7 @@ struct ReplayInner {
     fds: Arc<Semaphore>,
     budget: Arc<MemoryBudget>,
     _metadata: Option<MemoryCharge>,
-    _cleanup: AsyncCleanupGuard,
+    cleanup: AsyncCleanupGuard,
     _lease: Option<SortLease>,
 }
 
@@ -237,6 +238,7 @@ impl<V: DeserializeOwned> ReplayCursor<V> {
             self.remaining,
             Arc::clone(&self.inner.fds),
             Arc::clone(&self.inner.budget),
+            self.inner.cleanup.scope(),
         );
         let row = reader.next_row().await?;
         (self.offset, self.remaining) = reader.position();

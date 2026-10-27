@@ -27,6 +27,9 @@ pub enum SorterError {
         /// Unreserved bytes remaining in the shared budget.
         available: u64,
     },
+    /// An owned filesystem worker panicked or could not complete.
+    #[error("sort filesystem worker failed: {0}")]
+    Worker(String),
     /// The governor actor is no longer running (its task ended or every
     /// handle was dropped), so the sort could not be admitted.
     #[error("sort governor is not running")]

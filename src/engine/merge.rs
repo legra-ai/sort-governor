@@ -30,6 +30,7 @@ use crate::engine::budget::{
     RunResources,
 };
 use crate::engine::cleanup::AsyncCleanupGuard;
+use crate::engine::operation::IoScope;
 use crate::engine::row::RunRow;
 use crate::engine::run::{
     RunReader,
@@ -58,8 +59,9 @@ where
         path: &Path,
         fds: Arc<Semaphore>,
         budget: Arc<MemoryBudget>,
+        io: Arc<IoScope>,
     ) -> Result<Option<Self>, SorterError> {
-        let mut reader = RunReader::open(path, fds, budget).await?;
+        let mut reader = RunReader::open(path, fds, budget, io).await?;
         match reader.next_row().await? {
             Some(head) => Ok(Some(Self {
                 head: Some(head),
@@ -171,6 +173,7 @@ pub(crate) async fn merge_group_to_file<K, V>(
     dedup: bool,
     fds: Arc<Semaphore>,
     budget: Arc<MemoryBudget>,
+    io: Arc<IoScope>,
 ) -> Result<PathBuf, SorterError>
 where
     K: Ord + Clone + Serialize + DeserializeOwned,
@@ -179,13 +182,15 @@ where
     // bounded: two frontier inputs or a final-cascade group of at most fan_in.
     let mut sources: Vec<MergeSource<K, V>> = Vec::with_capacity(paths.len());
     for path in paths {
-        if let Some(source) = MergeSource::open(path, Arc::clone(&fds), Arc::clone(&budget)).await?
+        if let Some(source) =
+            MergeSource::open(path, Arc::clone(&fds), Arc::clone(&budget), Arc::clone(&io)).await?
         {
             sources.push(source);
         }
     }
     let mut state = MergeState::new(sources, dedup, Arc::clone(&budget))?;
-    let mut writer = RunWriter::create(out, Arc::clone(&fds), Arc::clone(&budget)).await?;
+    let mut writer =
+        RunWriter::create(out, Arc::clone(&fds), Arc::clone(&budget), Arc::clone(&io)).await?;
     while let Some(row) = state.next_row().await? {
         writer.write_row(&row).await?;
     }
@@ -218,6 +223,7 @@ where
     let RunResources {
         fds,
         memory: budget,
+        io,
     } = resources;
     let mut pass = 0u32;
     while runs.len() > fan_in {
@@ -236,6 +242,7 @@ where
                     false,
                     Arc::clone(&fds),
                     Arc::clone(&budget),
+                    Arc::clone(&io),
                 )
                 .await?,
             );
@@ -246,7 +253,8 @@ where
     // bounded: the final cascade has reduced the frontier to at most fan_in.
     let mut sources: Vec<MergeSource<K, V>> = Vec::with_capacity(runs.len());
     for path in &runs {
-        if let Some(source) = MergeSource::open(path, Arc::clone(&fds), Arc::clone(&budget)).await?
+        if let Some(source) =
+            MergeSource::open(path, Arc::clone(&fds), Arc::clone(&budget), Arc::clone(&io)).await?
         {
             sources.push(source);
         }

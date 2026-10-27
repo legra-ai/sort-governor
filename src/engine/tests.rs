@@ -196,6 +196,7 @@ async fn corrupt_run_row_surfaces_a_decode_error() {
         &path,
         std::sync::Arc::new(tokio::sync::Semaphore::new(2)),
         crate::engine::budget::MemoryBudget::new(1024 * 1024),
+        std::sync::Arc::new(crate::engine::operation::IoScope::default()),
     )
     .await
     .expect("open");
@@ -224,6 +225,7 @@ async fn truncated_run_surfaces_an_io_error() {
         &path,
         std::sync::Arc::new(tokio::sync::Semaphore::new(2)),
         crate::engine::budget::MemoryBudget::new(1024 * 1024),
+        std::sync::Arc::new(crate::engine::operation::IoScope::default()),
     )
     .await
     .expect("open");

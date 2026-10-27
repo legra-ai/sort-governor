@@ -82,9 +82,14 @@ impl Drop for MemoryCharge {
 pub(crate) struct RunResources {
     pub(crate) fds: Arc<tokio::sync::Semaphore>,
     pub(crate) memory: Arc<MemoryBudget>,
+    pub(crate) io: Arc<crate::engine::operation::IoScope>,
 }
 impl RunResources {
-    pub(crate) fn new(fds: Arc<tokio::sync::Semaphore>, memory: Arc<MemoryBudget>) -> Self {
-        Self { fds, memory }
+    pub(crate) fn new(
+        fds: Arc<tokio::sync::Semaphore>,
+        memory: Arc<MemoryBudget>,
+        io: Arc<crate::engine::operation::IoScope>,
+    ) -> Self {
+        Self { fds, memory, io }
     }
 }

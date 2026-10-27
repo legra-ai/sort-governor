@@ -6,6 +6,7 @@ pub(crate) mod budget;
 mod cleanup;
 mod codec;
 mod merge;
+mod operation;
 mod replay;
 mod row;
 mod run;
