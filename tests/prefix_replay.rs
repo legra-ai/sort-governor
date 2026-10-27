@@ -169,3 +169,53 @@ fn canceled_append_poisoning_never_publishes_the_inflight_tail() {
         root.remove().await.unwrap();
     });
 }
+
+struct WakeFlag(std::sync::atomic::AtomicBool);
+impl std::task::Wake for WakeFlag {
+    fn wake(self: Arc<Self>) {
+        self.0.store(true, std::sync::atomic::Ordering::Release);
+    }
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.0.store(true, std::sync::atomic::Ordering::Release);
+    }
+}
+
+#[tokio::test]
+async fn dropped_unsealed_writer_wakes_a_waiting_reader_with_failure_not_absence() {
+    let root = async_fs_io::TempDir::create(std::env::temp_dir())
+        .await
+        .unwrap();
+    let governor = SorterHandle::spawn(
+        SorterConfig::default(),
+        6,
+        Arc::new(StaticPressure::new(1024 * 1024, 0)),
+        root.path().to_path_buf(),
+    );
+    let mut writer = governor.replay_writer::<u32>().await.unwrap();
+    writer.append_with_size(1, 4).await.unwrap();
+    let mut cursor = writer.prefix_cursor();
+    assert_eq!(cursor.next_committed().await.unwrap(), ReplayStep::Item(1));
+    {
+        let waiting = cursor.next();
+        tokio::pin!(waiting);
+        let signaled = Arc::new(WakeFlag(std::sync::atomic::AtomicBool::new(false)));
+        let waker = Waker::from(Arc::clone(&signaled));
+        let mut context = Context::from_waker(&waker);
+        assert!(waiting.as_mut().poll(&mut context).is_pending());
+        drop(writer);
+        assert!(signaled.0.load(std::sync::atomic::Ordering::Acquire));
+        assert!(matches!(
+            waiting.as_mut().poll(&mut context),
+            std::task::Poll::Ready(Err(SorterError::ReplaySourceFailed))
+        ));
+    }
+    drop(cursor);
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while governor.stats().await.unwrap().memory_bytes_used != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    root.remove().await.unwrap();
+}
