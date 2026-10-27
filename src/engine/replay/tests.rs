@@ -25,8 +25,8 @@ fn cancelled_directory_creation_cannot_resurrect_scratch() {
             .await
             .unwrap();
         let mut writer = ReplayWriter::<u32>::with_temp_dir(root.path(), 1024 * 1024);
-        let path = writer.dir.clone();
-        let scope = writer.cleanup.scope();
+        let path = writer.inner.dir.clone();
+        let scope = std::sync::Arc::clone(&writer.inner.scope);
         let (ready, started) = oneshot::channel();
         let (release, gate) = mpsc::channel();
         // This boundary fixture occupies the sole OS worker so cancellation
@@ -72,7 +72,7 @@ async fn oversized_append_poisons_the_writer_before_creating_scratch() {
         .await
         .unwrap();
     let mut writer = ReplayWriter::<Vec<u8>>::with_temp_dir(root.path(), 64 * 1024);
-    let path = writer.dir.clone();
+    let path = writer.inner.dir.clone();
     let result = writer
         .append_with_size(
             vec![0; 128 * 1024],

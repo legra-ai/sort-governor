@@ -20,6 +20,7 @@ pub(crate) use merge::ValueStream;
 pub use replay::{
     Replay,
     ReplayCursor,
+    ReplayStep,
     ReplayWriter,
 };
 pub use session::SortSession;

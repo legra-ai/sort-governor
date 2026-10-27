@@ -115,6 +115,20 @@ measurement of allocator bookkeeping, runtime stacks, RSS or consumer memory.
 
 ### Replaying rows
 
+For demand-driven input, call `writer.prefix_cursor()` before sealing and use
+`cursor.next_committed().await?`. `ReplayStep::Item(value)` yields one complete
+frame. `AwaitingAppend` means the current prefix ended: the caller drives one
+more upstream row and appends it, then continues at the same cursor position.
+`Exhausted` is final EOF and appears only after the writer seals. Checkpoint
+clones retain independent positions while observing newly committed appends.
+No input relation must be drained merely to expose its first prefix value.
+
+The watermark advances after an entire frame is written and flushed. An error,
+cancelled append/seal, or dropped unsealed writer invalidates publication and
+wakes readers with a typed source failure; an incomplete tail never becomes a
+row or final absence. Cursors revalidate source state after an awaited read.
+
+
 `sorter.replay_writer::<V>().await?` opens a sequential append sink using the
 same run codec, scratch lifecycle and shared budgets. Append with
 `writer.append_with_size(value, retained_bytes).await?`, then

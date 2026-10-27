@@ -12,6 +12,7 @@ pub use config::SorterConfig;
 pub use engine::{
     Replay,
     ReplayCursor,
+    ReplayStep,
     ReplayWriter,
     SortSession,
 };

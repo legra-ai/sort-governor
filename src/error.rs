@@ -27,6 +27,9 @@ pub enum SorterError {
         /// Unreserved bytes remaining in the shared budget.
         available: u64,
     },
+    /// A replay publisher failed, was cancelled, or dropped before sealing.
+    #[error("replay source failed or was dropped before sealing")]
+    ReplaySourceFailed,
     /// Explicit replay cleanup was requested while cursors still own its
     /// storage.
     #[error("cannot close replay while cursors still own its storage")]
