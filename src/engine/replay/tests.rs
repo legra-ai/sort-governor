@@ -65,3 +65,69 @@ fn cancelled_directory_creation_cannot_resurrect_scratch() {
         root.remove().await.unwrap();
     });
 }
+
+#[tokio::test]
+async fn oversized_append_poisons_the_writer_before_creating_scratch() {
+    let root = async_fs_io::TempDir::create(std::env::temp_dir())
+        .await
+        .unwrap();
+    let mut writer = ReplayWriter::<Vec<u8>>::with_temp_dir(root.path(), 64 * 1024);
+    let path = writer.dir.clone();
+    let result = writer
+        .append_with_size(
+            vec![0; 128 * 1024],
+            128 * 1024 + std::mem::size_of::<Vec<u8>>(),
+        )
+        .await;
+    assert!(matches!(
+        result,
+        Err(crate::SorterError::MemoryBudget { .. })
+    ));
+    assert!(
+        DirectoryReader::open_if_exists(path)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(matches!(
+        writer.seal().await,
+        Err(crate::SorterError::SessionFailed)
+    ));
+    root.remove().await.unwrap();
+}
+
+#[tokio::test]
+async fn corrupt_frame_lengths_are_rejected_before_allocation_and_do_not_advance() {
+    let root = async_fs_io::TempDir::create(std::env::temp_dir())
+        .await
+        .unwrap();
+    let mut writer = ReplayWriter::<u32>::with_temp_dir(root.path(), 64 * 1024);
+    writer.append_with_size(11, 4).await.unwrap();
+    writer.append_with_size(22, 4).await.unwrap();
+    let replay = writer.seal().await.unwrap();
+    let mut cursor = replay.cursor();
+    assert_eq!(cursor.next().await.unwrap(), Some(11));
+    let checkpoint = cursor.offset;
+    let reserved = cursor.inner.budget.used();
+    let mut file = async_fs_io::AsyncFile::open_write_at_end(&cursor.inner.path)
+        .await
+        .unwrap();
+    file.seek(std::io::SeekFrom::Start(checkpoint))
+        .await
+        .unwrap();
+    file.write_all(&u32::MAX.to_le_bytes()).await.unwrap();
+    file.flush().await.unwrap();
+    drop(file);
+    assert!(matches!(
+        cursor.next().await,
+        Err(crate::SorterError::MemoryBudget { .. } | crate::SorterError::RunLimit)
+    ));
+    assert_eq!(cursor.offset, checkpoint);
+    assert_eq!(cursor.inner.budget.used(), reserved);
+    assert!(cursor.inner.budget.peak() <= cursor.inner.budget.limit());
+    assert_eq!(cursor.inner.fds.available_permits(), 2);
+    cursor.rewind();
+    assert_eq!(cursor.next().await.unwrap(), Some(11));
+    drop((cursor, replay));
+    root.remove().await.unwrap();
+}

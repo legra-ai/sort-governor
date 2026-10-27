@@ -82,8 +82,8 @@ where
     // after caller cancellation is deliberate: its OS job is not cancellable.
     // It performs no subsequent producer work and retains all I/O reservations.
     tokio::spawn(async move {
-        let _metadata = metadata;
         let result = operation.await;
+        drop(metadata);
         drop(permit);
         drop(guard);
         result
@@ -102,12 +102,13 @@ mod tests {
     async fn cancelled_caller_keeps_operation_reservations_until_the_os_job_finishes() {
         let fds = Arc::new(Semaphore::new(1));
         let scope = Arc::new(IoScope::default());
+        let memory = MemoryBudget::new(16384);
         let (started, ready) = oneshot::channel();
         let (release, done) = oneshot::channel();
         let task = tokio::spawn(perform(
             Arc::clone(&fds),
             Arc::clone(&scope),
-            MemoryBudget::new(16384),
+            Arc::clone(&memory),
             0,
             async move {
                 started.send(()).unwrap();
@@ -124,8 +125,10 @@ mod tests {
             "the OS job still owns its descriptor"
         );
         assert_eq!(scope.pending.load(Ordering::Acquire), 1);
+        assert!(memory.used() > 0);
         release.send(()).unwrap();
         scope.idle().await;
         assert_eq!(fds.available_permits(), 1);
+        assert_eq!(memory.used(), 0);
     }
 }
