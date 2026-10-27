@@ -4,11 +4,9 @@
 
 /// A request to sort a relation, sized but not yet executed.
 ///
-/// `estimated_rows` / `estimated_bytes` are the planner's only view of the
-/// input magnitude; they need not be exact, but a gross under-estimate
-/// pushes a large sort onto the in-memory path and a gross over-estimate
-/// wastes spill buffers. Callers derive them from cardinality estimates and
-/// per-row width.
+/// Estimates choose the initial strategy; they do not authorize unlimited
+/// retention. A zero byte estimate denotes unknown cardinality. Actual sized
+/// pushes are independently admitted and spill even an underestimated plan.
 #[derive(Debug, Clone)]
 pub struct SortSpec {
     estimated_rows: u64,

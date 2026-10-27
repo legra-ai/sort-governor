@@ -1,6 +1,6 @@
 //! The Sorter governor actor. It is the only place the global sort budgets
 //! are reconciled: it builds a [`SorterSnapshot`] from current pressure,
-//! plans each sort, reserves its file descriptors, and hands back a
+//! plans each sort, shares its resource budgets, and hands back a
 //! [`SortLease`]. Rows never reach it — it governs, it does not funnel.
 
 use std::path::PathBuf;
