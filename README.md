@@ -94,6 +94,8 @@ A zero-byte estimate means unknown size and selects a spill-capable plan.
 Actual retained-byte thresholds apply to both plans: underestimation cannot
 leave an unbounded in-memory relation. Stable ordinal tie-breaking permits an
 in-place unstable sort without allocating another run-sized sorting buffer.
+Runs that reach their local byte threshold spill before `push_with_size`
+returns, while their rows remain charged throughout the write.
 
 Every new reservation uses the smaller of the configured maximum run buffer
 and the pressure source's currently observed available target. Existing owned
@@ -112,6 +114,12 @@ in-flight operation bookkeeping. A record that cannot fit fails with a typed
 budget error before its frame allocation. Returned values transfer to their
 consumer, which must account for any values it retains. Reservations are not a
 measurement of allocator bookkeeping, runtime stacks, RSS or consumer memory.
+Cloned merge keys conservatively reserve the whole row's declared retained
+size because the input contract does not provide a separate key weight. A
+large value with a small key can therefore require substantially more merge
+headroom than its own retained bytes. Full local runs are released eagerly;
+this does not guarantee admission when another buffer, live pressure, merge
+heads or codec working space exhausts the shared cap.
 
 ### Replaying rows
 
