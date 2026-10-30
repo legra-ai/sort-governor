@@ -10,7 +10,7 @@ use crate::spec::SortSpec;
 
 /// A message to the Sorter actor.
 pub(crate) enum SorterCommand {
-    /// Admit a sort: plan it, reserve its resources, and return a lease.
+    /// Admit a sort: plan it, share its resource budgets, and return a lease.
     Submit {
         /// The sort's size description.
         spec: SortSpec,

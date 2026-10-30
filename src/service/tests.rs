@@ -77,7 +77,7 @@ async fn external_sort_through_handle_spills_and_merges() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn external_lease_holds_and_releases_fd_permits() {
+async fn external_lease_does_not_hold_idle_descriptors() {
     let (_dir, handle) = spawn(128, 8 * MIB, 0);
     let lease = handle
         .submit(SortSpec::new(1_000_000, 64 * MIB))
@@ -88,8 +88,8 @@ async fn external_lease_holds_and_releases_fd_permits() {
     let busy = handle.stats().await.expect("stats");
     assert_eq!(busy.fd_permits_total, 128);
     assert_eq!(busy.active_external_sorts, 1);
-    // Plentiful fds with no concurrency -> the full configured fan-in (64).
-    assert_eq!(busy.fd_permits_available, 128 - 64);
+    // Admission retains no files. Each actual open is separately rationed.
+    assert_eq!(busy.fd_permits_available, 128);
 
     drop(lease);
     let free = handle.stats().await.expect("stats");
@@ -98,34 +98,38 @@ async fn external_lease_holds_and_releases_fd_permits() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn exhausted_fd_budget_backpressures_the_next_external_sort() {
-    // A 64-permit budget with the default 64 fan-in: the first external sort
-    // takes every permit, so the second must wait until the first releases.
-    let (_dir, handle) = spawn(64, 8 * MIB, 0);
+async fn multiple_external_leases_share_the_actual_io_budget() {
+    let (_dir, handle) = spawn(6, 8 * MIB, 0);
     let first = handle
         .submit(SortSpec::new(1_000_000, 64 * MIB))
         .await
-        .expect("first submit");
-    assert!(first.plan().is_external());
-    let stats = handle.stats().await.expect("stats");
-    assert_eq!(stats.fd_permits_available, 0);
-
-    let second = handle.submit(SortSpec::new(1_000_000, 64 * MIB));
-    let pending = tokio::time::timeout(std::time::Duration::from_millis(200), second).await;
-    assert!(
-        pending.is_err(),
-        "second sort must block while permits are held"
-    );
-
-    drop(first);
+        .unwrap();
     let second = tokio::time::timeout(
-        std::time::Duration::from_secs(5),
+        std::time::Duration::from_millis(200),
         handle.submit(SortSpec::new(1_000_000, 64 * MIB)),
     )
     .await
-    .expect("second sort must be admitted once permits return")
-    .expect("submit");
-    assert!(second.plan().is_external());
+    .expect("idle admission cannot hoard descriptors")
+    .unwrap();
+    assert_eq!(handle.stats().await.unwrap().active_external_sorts, 2);
+    assert_eq!(handle.stats().await.unwrap().fd_permits_available, 6);
+    drop((first, second));
+    assert_eq!(handle.stats().await.unwrap().active_external_sorts, 0);
+}
+
+#[tokio::test]
+async fn nested_sorts_do_not_reserve_descriptors_before_io() {
+    let (_dir, handle) = spawn(6, 8 * MIB, 0);
+    let first = handle.submit(SortSpec::new(0, 0)).await.unwrap();
+    let second = tokio::time::timeout(
+        std::time::Duration::from_millis(200),
+        handle.submit(SortSpec::new(0, 0)),
+    )
+    .await
+    .expect("a parent sort must not block admission of its own input")
+    .unwrap();
+    assert_eq!(handle.stats().await.unwrap().fd_permits_available, 6);
+    drop((first, second));
 }
 
 #[test]

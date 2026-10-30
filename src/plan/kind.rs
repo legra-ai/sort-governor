@@ -3,13 +3,12 @@
 /// How a sort will be executed, chosen by [`crate::SortPlanner`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SortPlan {
-    /// Sort entirely in memory — a `Vec` sort that never opens a file
-    /// descriptor. Chosen for small sorts when the budget has headroom.
+    /// Start in memory for a small estimate. Actual retained-byte limits
+    /// still apply: underestimated input spills through the same engine.
     InMemory,
     /// Spill to disk and merge. `run_buffer_bytes` bounds the in-memory run
-    /// before each spill; `max_fan_in` bounds the number of run files open
-    /// at once during the (possibly cascaded) merge, so the process file
-    /// descriptor table can never be exhausted.
+    /// before each spill; `max_fan_in` bounds retained merge heads. Actual
+    /// file opens additionally acquire shared operation-scoped permits.
     External {
         /// In-memory run size before a spill, in bytes.
         run_buffer_bytes: usize,
@@ -25,7 +24,7 @@ impl SortPlan {
         matches!(self, SortPlan::External { .. })
     }
 
-    /// Whether this plan stays entirely in memory.
+    /// Whether this plan starts in memory, subject to runtime byte limits.
     #[must_use]
     pub fn is_in_memory(&self) -> bool {
         matches!(self, SortPlan::InMemory)

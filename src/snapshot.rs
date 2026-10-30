@@ -27,7 +27,7 @@ impl SorterSnapshot {
     /// - `fd_headroom` — usable sort file descriptors available right now,
     ///   already net of the safety margin (the actor sizes its fd semaphore to
     ///   `soft_limit - margin`, so this is its available-permit count).
-    /// - `active_external_sorts` — external sorts currently holding fds.
+    /// - `active_external_sorts` — external sessions and output streams.
     #[must_use]
     pub fn new(
         effective_target_bytes: u64,
@@ -61,7 +61,7 @@ impl SorterSnapshot {
         self.fd_headroom
     }
 
-    /// External sorts currently holding file descriptors.
+    /// External sessions and output streams currently active.
     #[must_use]
     pub fn active_external_sorts(&self) -> u32 {
         self.active_external_sorts
