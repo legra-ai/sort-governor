@@ -4,12 +4,15 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use serde::Serialize;
+use serde::de::DeserializeOwned;
 use tokio::sync::{
     mpsc,
     oneshot,
 };
 
 use crate::config::SorterConfig;
+use crate::engine::ReplayWriter;
 use crate::error::SorterError;
 use crate::service::actor::SorterActor;
 use crate::service::command::SorterCommand;
@@ -33,6 +36,9 @@ impl SorterHandle {
     /// number of usable file descriptors the Sorter may ration (the process
     /// soft limit minus a safety margin); sorts spill under unique
     /// directories beneath `scratch_root`.
+    ///
+    /// # Panics
+    /// Panics if the descriptor budget is zero.
     #[must_use]
     pub fn spawn(
         config: SorterConfig,
@@ -40,13 +46,14 @@ impl SorterHandle {
         pressure: Arc<dyn MemoryPressure>,
         scratch_root: PathBuf,
     ) -> Self {
+        assert!(fd_budget > 0, "sort descriptor budget must be positive");
         let (tx, rx) = mpsc::channel(COMMAND_CHANNEL_CAPACITY);
         let actor = SorterActor::new(config, fd_budget, pressure, scratch_root);
         tokio::spawn(actor.run(rx));
         Self { tx }
     }
 
-    /// Admit a sort: the governor plans it, reserves its resources, and
+    /// Admit a sort: the governor plans it, shares its I/O budget, and
     /// returns a lease. The returned lease must be held until the sort's
     /// value stream is fully consumed.
     ///
@@ -60,6 +67,20 @@ impl SorterHandle {
             .await
             .map_err(|_| SorterError::Gone)?;
         rx.await.map_err(|_| SorterError::Gone)?
+    }
+
+    /// Open a sequential replay sink sharing this governor's memory and I/O
+    /// budgets. The sink creates its scratch lazily on the first append/seal.
+    ///
+    /// # Errors
+    /// Returns [`SorterError::Gone`] if the governor has stopped.
+    pub async fn replay_writer<V: Serialize + DeserializeOwned + Send + 'static>(
+        &self,
+    ) -> Result<ReplayWriter<V>, SorterError> {
+        Ok(self
+            .submit(SortSpec::new(0, 0).labelled("replay"))
+            .await?
+            .into_replay_writer())
     }
 
     /// Read the governor's current counters.

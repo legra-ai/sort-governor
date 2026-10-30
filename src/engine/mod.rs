@@ -2,8 +2,12 @@
 //! spills, and merges according to a [`crate::SortPlan`], backed by a
 //! bounded async cascade merge over `async-fs-io`.
 
+pub(crate) mod budget;
 mod cleanup;
+mod codec;
 mod merge;
+mod operation;
+mod replay;
 mod row;
 mod run;
 mod session;
@@ -13,4 +17,10 @@ mod tests;
 
 #[cfg(test)]
 pub(crate) use merge::ValueStream;
+pub use replay::{
+    Replay,
+    ReplayCursor,
+    ReplayStep,
+    ReplayWriter,
+};
 pub use session::SortSession;

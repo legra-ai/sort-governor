@@ -5,20 +5,33 @@ use serde::{
     Serialize,
 };
 
+use crate::engine::budget::MemoryCharge;
+
 /// A single row threaded through the sort: the ordering key and its
 /// payload value. Serialized with the key first so a spilled run is
 /// self-describing.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct RunRow<K, V> {
     /// The ordering key.
     pub key: K,
     /// The payload carried alongside the key.
     pub value: V,
+    pub ordinal: u64,
+    #[serde(skip)]
+    pub retained_bytes: usize,
+    #[serde(skip)]
+    pub charge: Option<MemoryCharge>,
 }
 
 impl<K, V> RunRow<K, V> {
     /// Pair a key with its value.
     pub(crate) fn new(key: K, value: V) -> Self {
-        Self { key, value }
+        Self {
+            key,
+            value,
+            ordinal: 0,
+            retained_bytes: std::mem::size_of::<Self>(),
+            charge: None,
+        }
     }
 }

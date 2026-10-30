@@ -25,7 +25,8 @@ impl SortPlanner {
     #[must_use]
     pub fn plan(spec: &SortSpec, snap: &SorterSnapshot, cfg: &SorterConfig) -> SortPlan {
         let available = snap.available_memory_bytes();
-        if spec.estimated_bytes() <= cfg.in_memory_ceiling_bytes()
+        if spec.estimated_bytes() != 0
+            && spec.estimated_bytes() <= cfg.in_memory_ceiling_bytes()
             && available >= spec.estimated_bytes()
         {
             return SortPlan::InMemory;
