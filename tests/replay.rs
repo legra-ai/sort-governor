@@ -1,0 +1,276 @@
+//! Sealed replay preserves duplicates and independent bounded cursors.
+
+use std::sync::Arc;
+
+use futures_util::StreamExt;
+use sort_governor::{
+    SorterConfig,
+    SorterHandle,
+    StaticPressure,
+};
+
+#[tokio::test]
+async fn replay_cursors_checkpoint_without_holding_descriptors() {
+    let root = async_fs_io::TempDir::create(std::env::temp_dir())
+        .await
+        .unwrap();
+    let governor = SorterHandle::spawn(
+        SorterConfig::default(),
+        6,
+        Arc::new(StaticPressure::new(1024 * 1024, 0)),
+        root.path().join("governed"),
+    );
+    let mut writer = governor.replay_writer::<u32>().await.unwrap();
+    for value in [2, 2, 1, 3] {
+        writer.append_with_size(value, 4).await.unwrap();
+        assert_eq!(governor.stats().await.unwrap().fd_permits_available, 6);
+    }
+    let replay = writer.seal().await.unwrap();
+    let mut first = replay.cursor();
+    assert_eq!(first.next().await.unwrap(), Some(2));
+    let mut second = first.clone();
+    drop(replay);
+    assert_eq!(first.next().await.unwrap(), Some(2));
+    assert_eq!(second.next().await.unwrap(), Some(2));
+    assert_eq!(first.next().await.unwrap(), Some(1));
+    second.rewind();
+    assert_eq!(second.next().await.unwrap(), Some(2));
+    assert_eq!(first.next().await.unwrap(), Some(3));
+    assert_eq!(first.next().await.unwrap(), None);
+    assert_eq!(first.next().await.unwrap(), None);
+    assert_eq!(governor.stats().await.unwrap().fd_permits_available, 6);
+    drop((first, second));
+    root.remove().await.unwrap();
+}
+
+#[tokio::test]
+async fn replay_growth_keeps_resident_reservations_constant() {
+    let root = async_fs_io::TempDir::create(std::env::temp_dir())
+        .await
+        .unwrap();
+    let governor = SorterHandle::spawn(
+        SorterConfig::default(),
+        6,
+        Arc::new(StaticPressure::new(512 * 1024, 0)),
+        root.path().join("bytes"),
+    );
+    let mut writer = governor.replay_writer::<Vec<u8>>().await.unwrap();
+    let mut resident = None;
+    for index in 0..1024 {
+        let value = vec![u8::try_from(index % 251).unwrap(); 2048];
+        writer
+            .append_with_size(value, 2048 + std::mem::size_of::<Vec<u8>>())
+            .await
+            .unwrap();
+        let stats = governor.stats().await.unwrap();
+        assert!(stats.memory_bytes_peak <= stats.memory_bytes_limit);
+        assert_eq!(
+            *resident.get_or_insert(stats.memory_bytes_used),
+            stats.memory_bytes_used
+        );
+    }
+    let replay = writer.seal().await.unwrap();
+    let mut cursor = replay.cursor();
+    for index in 0..1024 {
+        let row = cursor.next().await.unwrap().unwrap();
+        assert_eq!(row.len(), 2048);
+        assert!(
+            row.iter()
+                .all(|byte| *byte == u8::try_from(index % 251).unwrap())
+        );
+        assert_eq!(
+            governor.stats().await.unwrap().memory_bytes_used,
+            resident.unwrap()
+        );
+    }
+    assert!(cursor.next().await.unwrap().is_none());
+    drop((cursor, replay));
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while governor.stats().await.unwrap().memory_bytes_used != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    root.remove().await.unwrap();
+}
+
+#[tokio::test]
+async fn nested_sorted_and_replayed_inputs_share_one_real_descriptor() {
+    let root = async_fs_io::TempDir::create(std::env::temp_dir())
+        .await
+        .unwrap();
+    let governor = SorterHandle::spawn(
+        SorterConfig::default(),
+        1,
+        Arc::new(StaticPressure::new(1024 * 1024, 0)),
+        root.path().join("one-fd"),
+    );
+    assert_eq!(governor.stats().await.unwrap().fd_permits_total, 1);
+    let mut outer = governor
+        .submit(sort_governor::SortSpec::new(0, 0))
+        .await
+        .unwrap()
+        .into_session::<u8, Vec<u8>>(false);
+    let mut inner = governor
+        .submit(sort_governor::SortSpec::new(0, 0))
+        .await
+        .unwrap()
+        .into_session::<u8, Vec<u8>>(false);
+    let mut replay = governor.replay_writer::<u8>().await.unwrap();
+    for key in (0..31u8).rev() {
+        inner
+            .push_with_size(key, vec![key; 16384], 16416)
+            .await
+            .unwrap();
+        replay.append_with_size(key, 1).await.unwrap();
+    }
+    let replay = replay.seal().await.unwrap();
+    let mut checkpoint = replay.cursor();
+    let mut sorted = inner.finish().await.unwrap();
+    for key in 0..31u8 {
+        assert_eq!(checkpoint.next().await.unwrap(), Some(30 - key));
+        let value = sorted.next().await.unwrap().unwrap();
+        assert!(value.iter().all(|byte| *byte == key));
+        outer.push_with_size(key, value, 16416).await.unwrap();
+        assert_eq!(governor.stats().await.unwrap().fd_permits_available, 1);
+    }
+    assert!(sorted.next().await.is_none());
+    let mut output = outer.finish().await.unwrap();
+    for key in 0..31u8 {
+        assert!(
+            output
+                .next()
+                .await
+                .unwrap()
+                .unwrap()
+                .iter()
+                .all(|byte| *byte == key)
+        );
+    }
+    assert!(output.next().await.is_none());
+    drop((checkpoint, replay, output, sorted));
+    root.remove().await.unwrap();
+}
+
+#[tokio::test]
+async fn independent_governors_never_reuse_a_live_scratch_identity() {
+    let root = async_fs_io::TempDir::create(std::env::temp_dir())
+        .await
+        .unwrap();
+    let pressure = Arc::new(StaticPressure::new(1024 * 1024, 0));
+    let first = SorterHandle::spawn(
+        SorterConfig::default(),
+        6,
+        pressure.clone(),
+        root.path().to_path_buf(),
+    );
+    let second = SorterHandle::spawn(
+        SorterConfig::default(),
+        6,
+        pressure,
+        root.path().to_path_buf(),
+    );
+    let left = first
+        .submit(sort_governor::SortSpec::new(0, 0))
+        .await
+        .unwrap();
+    let right = second
+        .submit(sort_governor::SortSpec::new(0, 0))
+        .await
+        .unwrap();
+    assert_ne!(
+        left.scratch_dir(),
+        right.scratch_dir(),
+        "scratch identity must survive independent governor lifetimes"
+    );
+    drop((left, right));
+    root.remove().await.unwrap();
+}
+
+#[tokio::test]
+async fn explicit_close_finishes_cleanup_before_releasing_its_reservation() {
+    let root = async_fs_io::TempDir::create(std::env::temp_dir())
+        .await
+        .unwrap();
+    let governor = SorterHandle::spawn(
+        SorterConfig::default(),
+        6,
+        Arc::new(StaticPressure::new(1024 * 1024, 0)),
+        root.path().join("close"),
+    );
+    let mut writer = governor.replay_writer::<u32>().await.unwrap();
+    writer.append_with_size(7, 4).await.unwrap();
+    let replay = writer.seal().await.unwrap();
+    let mut cursor = replay.cursor();
+    assert_eq!(cursor.next().await.unwrap(), Some(7));
+    assert_eq!(cursor.next().await.unwrap(), None);
+    drop(cursor);
+    assert!(governor.stats().await.unwrap().memory_bytes_used > 0);
+    replay.close().await.unwrap();
+    assert_eq!(governor.stats().await.unwrap().memory_bytes_used, 0);
+    let mut entries = async_fs_io::DirectoryReader::open(root.path().join("close"))
+        .await
+        .unwrap();
+    assert!(entries.next().await.unwrap().is_none());
+    drop(entries);
+    root.remove().await.unwrap();
+}
+
+#[tokio::test]
+async fn close_cannot_delete_storage_still_owned_by_a_cursor() {
+    let root = async_fs_io::TempDir::create(std::env::temp_dir())
+        .await
+        .unwrap();
+    let governor = SorterHandle::spawn(
+        SorterConfig::default(),
+        6,
+        Arc::new(StaticPressure::new(1024 * 1024, 0)),
+        root.path().join("in-use"),
+    );
+    let mut writer = governor.replay_writer::<u32>().await.unwrap();
+    writer.append_with_size(9, 4).await.unwrap();
+    let replay = writer.seal().await.unwrap();
+    let mut cursor = replay.cursor();
+    assert!(matches!(
+        replay.close().await,
+        Err(sort_governor::SorterError::ReplayInUse)
+    ));
+    assert_eq!(cursor.next().await.unwrap(), Some(9));
+    drop(cursor);
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while governor.stats().await.unwrap().memory_bytes_used != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    root.remove().await.unwrap();
+}
+
+#[tokio::test]
+async fn local_cap_configuration_cannot_replace_process_governance() {
+    let root = async_fs_io::TempDir::create(std::env::temp_dir())
+        .await
+        .unwrap();
+    let governor = SorterHandle::spawn(
+        SorterConfig::default(),
+        6,
+        Arc::new(StaticPressure::new(1024 * 1024, 0)),
+        root.path().to_path_buf(),
+    );
+    let lease = governor
+        .submit(sort_governor::SortSpec::new(0, 0))
+        .await
+        .unwrap();
+    let refused = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        lease
+            .into_session::<u32, u32>(false)
+            .with_memory_limit_bytes(1024)
+    }));
+    assert!(
+        refused.is_err(),
+        "local configuration must not replace the shared process budget"
+    );
+    root.remove().await.unwrap();
+}

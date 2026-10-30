@@ -22,6 +22,16 @@ fn small_sort_with_headroom_stays_in_memory() {
 }
 
 #[test]
+fn unknown_cardinality_requires_a_bounded_spill_plan() {
+    let spec = SortSpec::new(0, 0);
+    let snap = SorterSnapshot::new(GIB, 0, 6, 0);
+    assert!(
+        plan(&spec, &snap).is_external(),
+        "unknown input size cannot authorize unbounded in-memory retention"
+    );
+}
+
+#[test]
 fn small_sort_without_headroom_must_spill() {
     // Under the 8 MiB ceiling, but only 2 MiB of memory is available.
     let spec = SortSpec::new(10_000, 4 * MIB);

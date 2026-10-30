@@ -8,13 +8,11 @@
 
 A process-wide governor for bounded asynchronous sorting.
 
-Every sort in a process — small or huge, in memory or spilling to disk —
-is admitted by one `SorterHandle`. The governor decides **in-memory versus
-external** for each sort from its estimated size and the *live* memory and
-file-descriptor pressure, rations the **process-global** sort resources
-(open descriptors, spill memory, concurrent external sorts), and runs a
-**bounded, fully asynchronous cascade merge** whose memory and descriptor
-footprint stay `O(fan_in)` for any input size.
+Every sort in a process shares one `SorterHandle`. The governor plans from
+estimates, but actual retained rows and codec allocations are also reserved
+against a shared byte ceiling. Unknown and underestimated inputs spill. File
+permits cover actual operations and are released before a consumer pauses, so
+nested sorts and replay readers can make progress under the same descriptor cap.
 
 ## Why a governor?
 
@@ -33,13 +31,11 @@ independent failures once sorts run concurrently or inputs get large:
 4. **No global admission.** Even with every sort individually bounded, `N`
    concurrent sorts collectively exhaust the process.
 
-`sort-governor` addresses all four: one pure planner reconciles memory and
-descriptor pressure, one actor rations permits, every run reader holds
-exactly one descriptor and reads one row at a time over
-[`async-fs-io`](https://crates.io/crates/async-fs-io), and the cascade
-merge opens at most `fan_in` readers plus one output writer. During ingestion,
-a 64-level frontier combines adjacent runs as soon as their levels match;
-spill-path metadata stays fixed even when the input estimate is too small.
+One actor owns the shared budgets; row data stays in the calling task. The
+engine uses fully asynchronous [`async-fs-io`](https://crates.io/crates/async-fs-io)
+operations and a bounded merge frontier. Sixty-four optional path slots compact
+adjacent runs during ingestion. Readers retain positions and checked row counts,
+rather than open files, between pulls.
 
 ## Usage
 
@@ -59,23 +55,22 @@ async fn main() -> Result<(), SorterError> {
     // 256 usable descriptors, of which the governor may ration 160.
     let sorter = SorterHandle::spawn(SorterConfig::from_fd_limit(256), 160, pressure, scratch_root);
 
-    // Describe the sort; the governor plans it and hands back a lease that
-    // holds the sort's resource permits.
+    // Admission shares the process budget; it reserves no idle descriptors.
     let lease = sorter.submit(SortSpec::new(5, 5 * 16).labelled("example")).await?;
     let mut session = lease.into_session::<u32, String>(false);
     for key in [5_u32, 1, 4, 2, 3] {
-        session.push(key, format!("row {key}")).await?;
+        let value = format!("row {key}");
+        let retained = std::mem::size_of::<(u32, String)>() + value.capacity();
+        session.push_with_size(key, value, retained).await?;
     }
 
     // Values stream out in key order; the lease and any scratch directory are
     // released when the stream is fully consumed or dropped.
     let mut stream = session.finish().await?;
-    let mut ordered = Vec::new();
-    while let Some(value) = stream.next().await {
-        ordered.push(value?);
+    for expected in 1..=5 {
+        assert_eq!(stream.next().await.expect("one result")?, format!("row {expected}"));
     }
-    assert_eq!(ordered[0], "row 1");
-    assert_eq!(ordered[4], "row 5");
+    assert!(stream.next().await.is_none());
     Ok(())
 }
 ```
@@ -85,41 +80,97 @@ async fn main() -> Result<(), SorterError> {
 | Type              | Role                                                                                                   |
 | ----------------- | ------------------------------------------------------------------------------------------------------ |
 | `SortSpec`        | The caller's estimate: rows, bytes, dedup, label. The planner never sees the rows themselves.          |
-| `SorterConfig`    | Process-lifetime caps: in-memory ceiling, max fan-in, concurrent external sorts, run-buffer bounds.    |
+| `SorterConfig`    | Planner caps: in-memory threshold, maximum head fan-in and run-buffer sizes.    |
 | `MemoryPressure`  | Live memory readings (effective target, resident bytes). Implement it over your memory governor.       |
 | `SorterSnapshot`  | One point-in-time view of memory *and* descriptor pressure — the input the planner reconciles.         |
 | `SortPlanner`     | Pure and stateless: `(spec, snapshot, config) → SortPlan`. Exhaustively unit-testable.                 |
 | `SortPlan`        | `InMemory`, or `External { run_buffer_bytes, max_fan_in }`.                                            |
 | `SorterHandle`    | Cloneable client of the one governor actor; `submit` returns a lease, `stats` reports counters.        |
-| `SortLease`       | The admitted sort: its plan, a private scratch directory, and the descriptor and concurrency permits.  |
+| `SortLease`       | The admitted sort: its plan, private scratch directory, shared resource budgets and activity lifetime.  |
 | `SortSession`     | Push rows, `finish` into a `Stream` of values in key order. Spills and merges without caller involvement. |
 
-A sort stays in memory only when its estimate fits under the configured
-ceiling *and* the available memory can hold it. Otherwise the planner shares
-the descriptor headroom across the sorts in flight (floored at two — a merge
-needs two inputs), then sizes the run buffer so the run count stays within
-`fan_in²` without exceeding available memory.
-Under descriptor pressure it deliberately spends memory to keep pass depth
-small. Incremental frontier compaction bounds metadata independently of that
-estimate, with logarithmic merge depth instead of repeatedly rewriting the
-whole accumulated input.
+A nonzero estimate below the in-memory threshold starts without disk I/O.
+A zero-byte estimate means unknown size and selects a spill-capable plan.
+Actual retained-byte thresholds apply to both plans: underestimation cannot
+leave an unbounded in-memory relation. Stable ordinal tie-breaking permits an
+in-place unstable sort without allocating another run-sized sorting buffer.
+Runs that reach their local byte threshold spill before `push_with_size`
+returns, while their rows remain charged throughout the write.
+
+Every new reservation uses the smaller of the configured maximum run buffer
+and the pressure source's currently observed available target. Existing owned
+rows are not magically reclaimed when the target shrinks; new allocations fail
+until enough reservations are released. Deferred cleanup keeps its metadata
+reservation until its filesystem work completes, bounding the cleanup backlog
+with the same byte budget. Scratch identities are unique across governor
+lifetimes even when callers share a temporary root.
+
+`push_with_size` and `append_with_size` require the caller's actual retained
+key/value size, including owned capacities and nested data. Shared backing may
+be conservatively overcounted. `push` is for values without owned heap data.
+The engine separately charges row-vector capacities, cloned merge keys, bounded
+frontier/path metadata, measured CBOR frames, file-buffer working space and
+in-flight operation bookkeeping. A record that cannot fit fails with a typed
+budget error before its frame allocation. Returned values transfer to their
+consumer, which must account for any values it retains. Reservations are not a
+measurement of allocator bookkeeping, runtime stacks, RSS or consumer memory.
+Cloned merge keys conservatively reserve the whole row's declared retained
+size because the input contract does not provide a separate key weight. A
+large value with a small key can therefore require substantially more merge
+headroom than its own retained bytes. Full local runs are released eagerly;
+this does not guarantee admission when another buffer, live pressure, merge
+heads or codec working space exhausts the shared cap.
+
+### Replaying rows
+
+For demand-driven input, call `writer.prefix_cursor()` before sealing and use
+`cursor.next_committed().await?`. `ReplayStep::Item(value)` yields one complete
+frame. `AwaitingAppend` means the current prefix ended: the caller drives one
+more upstream row and appends it, then continues at the same cursor position.
+`Exhausted` is final EOF and appears only after the writer seals. Checkpoint
+clones retain independent positions while observing newly committed appends.
+No input relation must be drained merely to expose its first prefix value.
+
+The watermark advances after an entire frame is written and flushed. An error,
+cancelled append/seal, or dropped unsealed writer invalidates publication and
+wakes readers with a typed source failure; an incomplete tail never becomes a
+row or final absence. Cursors revalidate source state after an awaited read.
+
+
+`sorter.replay_writer::<V>().await?` opens a sequential append sink using the
+same run codec, scratch lifecycle and shared budgets. Append with
+`writer.append_with_size(value, retained_bytes).await?`, then
+`writer.seal().await?` to obtain immutable `Replay<V>`. A replay cursor's
+`next().await?` yields one owned value. Cloning a cursor checkpoints its current
+position; `rewind()` returns it to the beginning. Duplicate rows and insertion
+order are preserved. Cursors share storage ownership, allocate no row buffers
+when cloned, and retain no descriptor or decoded row between calls. Drop all
+cursors and call `replay.close().await?` when a group/relation is finished to
+complete cleanup in-band before constructing the next group. Closing while a
+cursor still owns storage returns a typed error; early-drop cleanup preserves
+that cursor's ownership.
+
+The standalone `SortSession::with_temp_dir` and
+`ReplayWriter::with_temp_dir(root, byte_cap)` use this same engine with local
+budgets. Aggregate process governance requires sharing one `SorterHandle`.
 
 ## Guarantees
 
-- **Bounded memory.** A session buffers at most one run; the merge holds one
-  head row per open reader. Spill metadata occupies 64 optional path slots,
-  one per bit in the checked 64-bit run counter. Nothing materialises the
-  whole input.
-- **Bounded descriptors.** At most `max_fan_in` readers and one output writer are
-  open per sort. The governor's semaphore rations reader permits across sorts.
+- **Bounded retention.** Input magnitude does not grow the run frontier, merge
+  fan-in or replay cursor state. Byte reservations cover live engine data and
+  fail rather than silently exceed the shared cap.
+- **Bounded descriptors.** Every actual file operation acquires one shared
+  permit. No admitted session or paused output holds an idle descriptor;
+  nested sort/replay combinations work even with a one-descriptor budget.
 - **Asynchronous throughout.** All spill and merge I/O is awaited over
   `async-fs-io`; no blocking calls run on Tokio worker threads.
 - **Deterministic order.** Equal keys are emitted in run order; with dedup,
   the first row of each equal-key group survives.
-- **Self-cleaning.** The scratch directory is created lazily on the first
-  spill and removed when the output stream ends or is dropped — and also when
-  a spilled session is dropped before `finish()` (an error-path bail-out
-  cannot leak run files).
+- **Self-cleaning.** Scratch is armed before asynchronous directory creation,
+  owned through output/replay lifetimes and removed on completion or drop.
+  A cancelled caller leaves only its bounded, inherently non-cancellable OS
+  operation running; that operation retains its permits and frame reservations.
+  Cleanup waits for this scratch directory's operations before removing it.
 - **Fail fast.** I/O, encode, and decode failures surface as typed
   `SorterError` variants; there are no silent fallbacks. Run-counter exhaustion
   fails before creating another file. A failed or cancelled spill invalidates

@@ -1,4 +1,4 @@
-//! An admitted sort and the global resources it holds.
+//! An admitted sort sharing the governor's operation-scoped descriptor budget.
 
 use std::path::{
     Path,
@@ -12,9 +12,13 @@ use std::sync::atomic::{
 
 use serde::Serialize;
 use serde::de::DeserializeOwned;
-use tokio::sync::OwnedSemaphorePermit;
+use tokio::sync::Semaphore;
 
-use crate::engine::SortSession;
+use crate::engine::budget::MemoryBudget;
+use crate::engine::{
+    ReplayWriter,
+    SortSession,
+};
 use crate::plan::SortPlan;
 
 /// Decrements the active-sort counter when its lease is dropped.
@@ -29,46 +33,63 @@ impl Drop for ActiveGuard {
     }
 }
 
-/// An admitted sort: the chosen [`SortPlan`], a private scratch directory,
-/// and the global resource permits held for the sort's lifetime.
+/// An admitted sort: a plan, a private scratch path and a shared I/O budget.
 ///
-/// Dropping the lease returns the file-descriptor permits and the
-/// concurrency slot. **Keep the lease alive until the value stream from
-/// [`SortSession::finish`] is fully consumed** — dropping it early returns
-/// the fd budget while the merge may still be reading run files.
+/// Admission never reserves idle descriptors. Every engine file operation
+/// acquires a permit and closes its file before returning. This permits nested
+/// sorts to make progress while their parent's input is being produced.
 #[derive(Debug)]
 pub struct SortLease {
     plan: SortPlan,
     scratch_dir: PathBuf,
-    _fd_permit: Option<OwnedSemaphorePermit>,
+    fds: Arc<Semaphore>,
+    memory: Arc<MemoryBudget>,
     _active: Option<ActiveGuard>,
 }
 
 impl SortLease {
     /// An in-memory lease: no fd permits, no concurrency slot.
-    pub(crate) fn in_memory(plan: SortPlan, scratch_dir: PathBuf) -> Self {
+    pub(crate) fn in_memory(
+        plan: SortPlan,
+        scratch_dir: PathBuf,
+        fds: Arc<Semaphore>,
+        memory: Arc<MemoryBudget>,
+    ) -> Self {
         Self {
             plan,
             scratch_dir,
-            _fd_permit: None,
+            fds,
+            memory,
             _active: None,
         }
     }
 
-    /// An external lease holding `fd_permit` file-descriptor permits and a
-    /// slot in the active-sort count.
+    /// An external lease sharing the descriptor budget and tracking activity.
     pub(crate) fn external(
         plan: SortPlan,
         scratch_dir: PathBuf,
-        fd_permit: OwnedSemaphorePermit,
+        fds: Arc<Semaphore>,
+        memory: Arc<MemoryBudget>,
         active: Arc<AtomicU32>,
     ) -> Self {
         Self {
             plan,
             scratch_dir,
-            _fd_permit: Some(fd_permit),
+            fds,
+            memory,
             _active: Some(ActiveGuard { active }),
         }
+    }
+
+    pub(crate) fn into_replay_writer<V: Serialize + DeserializeOwned + Send + 'static>(
+        self,
+    ) -> ReplayWriter<V> {
+        ReplayWriter::new(
+            self.scratch_dir.clone(),
+            Arc::clone(&self.fds),
+            Arc::clone(&self.memory),
+            Some(self),
+        )
     }
 
     /// The plan chosen for this sort.
@@ -84,8 +105,8 @@ impl SortLease {
     }
 
     /// Open the sort session bound to this lease, consuming the lease into
-    /// the session so its fd permits live for as long as the sort's output
-    /// stream — there is no way to drop the lease early by accident.
+    /// the session so activity and resource accounting follow its output
+    /// stream.
     #[must_use]
     pub fn into_session<K, V>(self, dedup: bool) -> SortSession<K, V>
     where
@@ -94,6 +115,9 @@ impl SortLease {
     {
         let plan = self.plan;
         let dir = self.scratch_dir.clone();
-        SortSession::new(plan, dir, dedup).hold_resource(Box::new(self))
+        SortSession::new(plan, dir, dedup)
+            .with_fd_budget(Arc::clone(&self.fds))
+            .with_memory_budget(Arc::clone(&self.memory))
+            .hold_resource(Box::new(self))
     }
 }

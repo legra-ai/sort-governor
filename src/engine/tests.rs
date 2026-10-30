@@ -187,11 +187,19 @@ async fn corrupt_run_row_surfaces_a_decode_error() {
     // One row claimed, three bytes of garbage that is not a CBOR `RunRow`.
     file.write_all(&1u64.to_le_bytes()).await.expect("count");
     file.write_all(&3u32.to_le_bytes()).await.expect("len");
+    file.write_all(&64u64.to_le_bytes()).await.expect("weight");
     file.write_all(&[0xff, 0xff, 0xff]).await.expect("body");
     file.flush().await.expect("flush");
     drop(file);
 
-    let mut reader: RunReader<u32, u32> = RunReader::open(&path).await.expect("open");
+    let mut reader: RunReader<u32, u32> = RunReader::open(
+        &path,
+        std::sync::Arc::new(tokio::sync::Semaphore::new(2)),
+        crate::engine::budget::MemoryBudget::new(1024 * 1024),
+        std::sync::Arc::new(crate::engine::operation::IoScope::default()),
+    )
+    .await
+    .expect("open");
     let err = reader
         .next_row()
         .await
@@ -208,11 +216,19 @@ async fn truncated_run_surfaces_an_io_error() {
     // One row claimed, a 64-byte frame promised, but the file ends early.
     file.write_all(&1u64.to_le_bytes()).await.expect("count");
     file.write_all(&64u32.to_le_bytes()).await.expect("len");
+    file.write_all(&64u64.to_le_bytes()).await.expect("weight");
     file.write_all(&[0u8; 8]).await.expect("partial body");
     file.flush().await.expect("flush");
     drop(file);
 
-    let mut reader: RunReader<u32, u32> = RunReader::open(&path).await.expect("open");
+    let mut reader: RunReader<u32, u32> = RunReader::open(
+        &path,
+        std::sync::Arc::new(tokio::sync::Semaphore::new(2)),
+        crate::engine::budget::MemoryBudget::new(1024 * 1024),
+        std::sync::Arc::new(crate::engine::operation::IoScope::default()),
+    )
+    .await
+    .expect("open");
     let err = reader
         .next_row()
         .await
