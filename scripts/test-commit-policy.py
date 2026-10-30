@@ -9,6 +9,17 @@ import unittest
 
 
 class CommitPolicyTests(unittest.TestCase):
+    def test_breaking_releases_use_the_owner_approved_minor_policy(self):
+        root = Path(__file__).resolve().parents[1]
+        workflow = (root / ".github/workflows/ci.yml").read_text()
+        self.assertRegex(
+            workflow,
+            r"(?s)uses: legra-ai/github-actions/\.github/actions/prepare-cargo-release@[^\n]+"
+            r"\n        id: release\n        with:\n"
+            r"(?:          [^\n]+\n)*?          breaking-change-bump: minor\n",
+            "Both release planning and preparation must select minor for breaking changes",
+        )
+
     def test_ci_and_hooks_share_pinned_toolchains(self):
         root = Path(__file__).resolve().parents[1]
         self.assertRegex((root / "rustfmt-toolchain").read_text().strip(), r"^nightly-\d{4}-\d{2}-\d{2}$")
