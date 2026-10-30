@@ -39,6 +39,7 @@ jobs:
         id: release
         with:
           token: ${{ steps.writer.outputs.token }}
+          breaking-change-bump: minor
 
   test:
     needs: prepare
