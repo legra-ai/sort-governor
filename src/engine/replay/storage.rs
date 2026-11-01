@@ -27,7 +27,7 @@ pub(super) struct ReplayInner {
     pub(super) budget: Arc<MemoryBudget>,
     pub(super) scope: Arc<IoScope>,
     pub(super) publication: Arc<Publication>,
-    cleanup: Mutex<AsyncCleanupGuard>,
+    pub(super) cleanup: Mutex<AsyncCleanupGuard>,
     _lease: Option<SortLease>,
 }
 

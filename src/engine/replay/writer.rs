@@ -145,6 +145,34 @@ impl<V: Serialize + DeserializeOwned + Send + 'static> ReplayWriter<V> {
         Ok(())
     }
 
+    /// Invalidate publication and await removal of this writer's scratch.
+    ///
+    /// Drop every prefix cursor before calling this method. Failed or cancelled
+    /// appends remain abortable; abort never attempts to publish a final EOF.
+    /// Repeated successful calls are harmless. If the abort future is
+    /// cancelled, the original cleanup owner remains in this writer so a
+    /// later call joins outstanding filesystem work before returning.
+    ///
+    /// # Errors
+    /// Returns [`SorterError::ReplayInUse`] while prefix cursors retain
+    /// storage, or propagates cleanup failures. Readers are invalidated
+    /// even when they prevent exclusive cleanup. Drop them and retry on the
+    /// same writer.
+    ///
+    /// # Panics
+    /// Panics if the internal scratch-owner mutex is poisoned.
+    pub async fn abort(&mut self) -> Result<(), SorterError> {
+        self.inner.publication.fail();
+        self.writer = None;
+        let inner = Arc::get_mut(&mut self.inner).ok_or(SorterError::ReplayInUse)?;
+        inner
+            .cleanup
+            .get_mut()
+            .expect("replay scratch owner poisoned")
+            .cleanup()
+            .await
+    }
+
     /// Publish final EOF after flushing the complete input. Existing prefix
     /// cursors observe the same final watermark and keep their positions.
     ///
