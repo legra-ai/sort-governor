@@ -150,6 +150,13 @@ complete cleanup in-band before constructing the next group. Closing while a
 cursor still owns storage returns a typed error; early-drop cleanup preserves
 that cursor's ownership.
 
+For an append that failed or was cancelled, drop its prefix cursors and await
+`writer.abort().await?` before dropping the writer. Abort invalidates publication
+and removes scratch through the same owner; it never tries to seal a failed
+stream. A retained cursor produces `ReplayInUse`, so drop it and retry. Repeated
+abort is safe, including after cancellation of an earlier abort future: cleanup
+still waits for the original filesystem operations and retains their budgets.
+
 The standalone `SortSession::with_temp_dir` and
 `ReplayWriter::with_temp_dir(root, byte_cap)` use this same engine with local
 budgets. Aggregate process governance requires sharing one `SorterHandle`.
