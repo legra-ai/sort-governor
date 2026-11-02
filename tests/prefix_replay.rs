@@ -158,6 +158,7 @@ fn canceled_append_poisoning_never_publishes_the_inflight_tail() {
         release.send(()).unwrap();
         os_worker.await.unwrap();
         drop(cursor);
+        writer.abort().await.unwrap();
         tokio::time::timeout(Duration::from_secs(2), async {
             while governor.stats().await.unwrap().memory_bytes_used != 0 {
                 tokio::task::yield_now().await;
