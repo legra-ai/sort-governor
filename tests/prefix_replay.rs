@@ -32,7 +32,7 @@ async fn committed_prefix_checkpoints_distinguish_more_input_from_final_eof() {
         root.path().to_path_buf(),
     );
     let mut writer = governor.replay_writer::<u32>().await.unwrap();
-    let mut cursor = writer.prefix_cursor();
+    let mut cursor = writer.prefix_cursor().unwrap();
     assert_eq!(
         cursor.next_committed().await.unwrap(),
         ReplayStep::AwaitingAppend
@@ -84,7 +84,7 @@ async fn caller_can_emit_first_witness_after_pulling_only_one_input_row() {
         root.path().to_path_buf(),
     );
     let mut writer = governor.replay_writer::<u32>().await.unwrap();
-    let mut cursor = writer.prefix_cursor();
+    let mut cursor = writer.prefix_cursor().unwrap();
     let mut input = 0..10_000u32;
     let mut pulled = 0;
     loop {
@@ -132,7 +132,7 @@ fn canceled_append_poisoning_never_publishes_the_inflight_tail() {
         );
         let mut writer = governor.replay_writer::<u32>().await.unwrap();
         writer.append_with_size(1, 4).await.unwrap();
-        let mut cursor = writer.prefix_cursor();
+        let mut cursor = writer.prefix_cursor().unwrap();
         assert_eq!(cursor.next_committed().await.unwrap(), ReplayStep::Item(1));
         let (ready, started) = oneshot::channel();
         let (release, gate) = mpsc::channel();
@@ -193,7 +193,7 @@ async fn dropped_unsealed_writer_wakes_a_waiting_reader_with_failure_not_absence
     );
     let mut writer = governor.replay_writer::<u32>().await.unwrap();
     writer.append_with_size(1, 4).await.unwrap();
-    let mut cursor = writer.prefix_cursor();
+    let mut cursor = writer.prefix_cursor().unwrap();
     assert_eq!(cursor.next_committed().await.unwrap(), ReplayStep::Item(1));
     {
         let waiting = cursor.next();

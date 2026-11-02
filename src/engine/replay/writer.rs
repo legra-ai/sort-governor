@@ -25,14 +25,16 @@ use crate::service::SortLease;
 
 /// Bounded append sink. Complete prefixes are readable before the source ends.
 pub struct ReplayWriter<V> {
-    pub(super) inner: Arc<ReplayInner>,
+    pub(super) inner: Option<Arc<ReplayInner>>,
     writer: Option<RunWriter>,
     rows: u64,
     marker: PhantomData<fn() -> V>,
 }
 impl<V> Drop for ReplayWriter<V> {
     fn drop(&mut self) {
-        self.inner.publication.fail();
+        if let Some(inner) = &self.inner {
+            inner.publication.fail();
+        }
     }
 }
 
@@ -44,7 +46,7 @@ impl<V: Serialize + DeserializeOwned + Send + 'static> ReplayWriter<V> {
         lease: Option<SortLease>,
     ) -> Self {
         Self {
-            inner: ReplayInner::new(dir, fds, budget, lease),
+            inner: Some(ReplayInner::new(dir, fds, budget, lease)),
             writer: None,
             rows: 0,
             marker: PhantomData,
@@ -65,17 +67,28 @@ impl<V: Serialize + DeserializeOwned + Send + 'static> ReplayWriter<V> {
 
     /// Read complete committed prefixes without sealing or pulling more input.
     /// Cursor construction performs no I/O and allocates no row buffers.
-    #[must_use]
-    pub fn prefix_cursor(&self) -> ReplayCursor<V> {
-        ReplayCursor::new(Arc::clone(&self.inner))
+    ///
+    /// # Errors
+    /// Rejects a failed, aborted or already sealed writer.
+    pub fn prefix_cursor(&self) -> Result<ReplayCursor<V>, SorterError> {
+        let inner = self.active()?;
+        inner.publication.snapshot()?;
+        Ok(ReplayCursor::new(inner))
+    }
+
+    fn active(&self) -> Result<Arc<ReplayInner>, SorterError> {
+        self.inner
+            .as_ref()
+            .map(Arc::clone)
+            .ok_or(SorterError::SessionFailed)
     }
 
     async fn prepare(&mut self) -> Result<(), SorterError> {
         if self.writer.is_some() {
             return Ok(());
         }
-        let bytes = self
-            .inner
+        let inner = self.active()?;
+        let bytes = inner
             .dir
             .capacity()
             .checked_add(128)
@@ -86,12 +99,12 @@ impl<V: Serialize + DeserializeOwned + Send + 'static> ReplayWriter<V> {
                 )
             })
             .ok_or(SorterError::RunLimit)?;
-        self.inner.arm(self.inner.budget.reserve(bytes)?);
-        let directory = self.inner.dir.clone();
+        inner.arm(inner.budget.reserve(bytes)?);
+        let directory = inner.dir.clone();
         perform(
-            Arc::clone(&self.inner.fds),
-            Arc::clone(&self.inner.scope),
-            Arc::clone(&self.inner.budget),
+            Arc::clone(&inner.fds),
+            Arc::clone(&inner.scope),
+            Arc::clone(&inner.budget),
             directory.capacity(),
             async move {
                 async_fs_io::ensure_dir(directory).await?;
@@ -101,10 +114,10 @@ impl<V: Serialize + DeserializeOwned + Send + 'static> ReplayWriter<V> {
         .await?;
         self.writer = Some(
             RunWriter::create(
-                self.inner.path.clone(),
-                Arc::clone(&self.inner.fds),
-                Arc::clone(&self.inner.budget),
-                Arc::clone(&self.inner.scope),
+                inner.path.clone(),
+                Arc::clone(&inner.fds),
+                Arc::clone(&inner.budget),
+                Arc::clone(&inner.scope),
             )
             .await?,
         );
@@ -127,11 +140,12 @@ impl<V: Serialize + DeserializeOwned + Send + 'static> ReplayWriter<V> {
         value: V,
         retained_bytes: usize,
     ) -> Result<(), SorterError> {
-        let operation = self.inner.publication.begin()?;
+        let inner = self.active()?;
+        let operation = inner.publication.begin()?;
         let next = self.rows.checked_add(1).ok_or(SorterError::RunLimit)?;
         let mut row = RunRow::new((), value);
         row.retained_bytes = retained_bytes.max(std::mem::size_of::<RunRow<(), V>>());
-        row.charge = Some(self.inner.budget.reserve(row.retained_bytes)?);
+        row.charge = Some(inner.budget.reserve(row.retained_bytes)?);
         row.ordinal = self.rows;
         self.prepare().await?;
         self.writer
@@ -140,7 +154,7 @@ impl<V: Serialize + DeserializeOwned + Send + 'static> ReplayWriter<V> {
             .write_row(&row)
             .await?;
         self.rows = next;
-        self.inner.publication.publish(next)?;
+        inner.publication.publish(next)?;
         operation.complete();
         Ok(())
     }
@@ -162,9 +176,12 @@ impl<V: Serialize + DeserializeOwned + Send + 'static> ReplayWriter<V> {
     /// # Panics
     /// Panics if the internal scratch-owner mutex is poisoned.
     pub async fn abort(&mut self) -> Result<(), SorterError> {
-        self.inner.publication.fail();
+        let Some(inner) = self.inner.as_mut() else {
+            return Ok(());
+        };
+        inner.publication.fail();
         self.writer = None;
-        let inner = Arc::get_mut(&mut self.inner).ok_or(SorterError::ReplayInUse)?;
+        let inner = Arc::get_mut(inner).ok_or(SorterError::ReplayInUse)?;
         inner
             .cleanup
             .get_mut()
@@ -175,24 +192,28 @@ impl<V: Serialize + DeserializeOwned + Send + 'static> ReplayWriter<V> {
 
     /// Publish final EOF after flushing the complete input. Existing prefix
     /// cursors observe the same final watermark and keep their positions.
+    /// Success transfers the original scratch owner to the returned replay.
+    /// Failure or cancellation leaves it here for [`Self::abort`]; no cleanup
+    /// owner is consumed before publication succeeds.
     ///
     /// # Errors
     /// Returns budget/I/O failures or rejects a failed/cancelled writer.
     ///
     /// # Panics
     /// Panics if internal prepared-writer or scratch-owner invariants fail.
-    pub async fn seal(mut self) -> Result<Replay<V>, SorterError> {
-        let operation = self.inner.publication.begin()?;
+    pub async fn seal(&mut self) -> Result<Replay<V>, SorterError> {
+        let inner = self.active()?;
+        let operation = inner.publication.begin()?;
         self.prepare().await?;
         self.writer
             .take()
             .expect("prepared replay writer")
             .finish()
             .await?;
-        self.inner.publication.seal()?;
+        inner.publication.seal()?;
         operation.complete();
         Ok(Replay {
-            inner: Arc::clone(&self.inner),
+            inner: self.inner.take().expect("active replay owner"),
             marker: PhantomData,
         })
     }
