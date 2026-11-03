@@ -49,6 +49,7 @@ async fn new_allocations_stop_when_live_memory_headroom_is_revoked() {
         writer.seal().await,
         Err(SorterError::SessionFailed)
     ));
+    writer.abort().await.unwrap();
     tokio::time::timeout(std::time::Duration::from_secs(2), async {
         while governor.stats().await.unwrap().memory_bytes_used != 0 {
             tokio::task::yield_now().await;

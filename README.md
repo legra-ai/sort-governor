@@ -123,7 +123,7 @@ heads or codec working space exhausts the shared cap.
 
 ### Replaying rows
 
-For demand-driven input, call `writer.prefix_cursor()` before sealing and use
+For demand-driven input, call `writer.prefix_cursor()?` before sealing and use
 `cursor.next_committed().await?`. `ReplayStep::Item(value)` yields one complete
 frame. `AwaitingAppend` means the current prefix ended: the caller drives one
 more upstream row and appends it, then continues at the same cursor position.
@@ -140,7 +140,10 @@ row or final absence. Cursors revalidate source state after an awaited read.
 `sorter.replay_writer::<V>().await?` opens a sequential append sink using the
 same run codec, scratch lifecycle and shared budgets. Append with
 `writer.append_with_size(value, retained_bytes).await?`, then
-`writer.seal().await?` to obtain immutable `Replay<V>`. A replay cursor's
+`writer.seal().await?` to obtain immutable `Replay<V>`. Sealing borrows the
+mutable writer and transfers its scratch owner only on success; failed or
+cancelled sealing leaves that owner available to `abort`. The sealed writer
+rejects new appends and cursor creation. A replay cursor's
 `next().await?` yields one owned value. Cloning a cursor checkpoints its current
 position; `rewind()` returns it to the beginning. Duplicate rows and insertion
 order are preserved. Cursors share storage ownership, allocate no row buffers
@@ -149,6 +152,13 @@ cursors and call `replay.close().await?` when a group/relation is finished to
 complete cleanup in-band before constructing the next group. Closing while a
 cursor still owns storage returns a typed error; early-drop cleanup preserves
 that cursor's ownership.
+
+For an append or seal that failed or was cancelled, drop its prefix cursors and await
+`writer.abort().await?` before dropping the writer. Abort invalidates publication
+and removes scratch through the same owner; it never tries to seal a failed
+stream. A retained cursor produces `ReplayInUse`, so drop it and retry. Repeated
+abort is safe, including after cancellation of an earlier abort future: cleanup
+still waits for the original filesystem operations and retains their budgets.
 
 The standalone `SortSession::with_temp_dir` and
 `ReplayWriter::with_temp_dir(root, byte_cap)` use this same engine with local
