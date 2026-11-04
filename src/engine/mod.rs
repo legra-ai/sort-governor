@@ -7,6 +7,7 @@ mod cleanup;
 mod codec;
 mod merge;
 mod operation;
+mod output;
 mod replay;
 mod row;
 mod run;
@@ -15,8 +16,7 @@ mod session;
 #[cfg(test)]
 mod tests;
 
-#[cfg(test)]
-pub(crate) use merge::ValueStream;
+pub use output::SortOutput;
 pub use replay::{
     Replay,
     ReplayCursor,
