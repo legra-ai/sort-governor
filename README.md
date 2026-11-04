@@ -87,7 +87,8 @@ async fn main() -> Result<(), SorterError> {
 | `SortPlan`        | `InMemory`, or `External { run_buffer_bytes, max_fan_in }`.                                            |
 | `SorterHandle`    | Cloneable client of the one governor actor; `submit` returns a lease, `stats` reports counters.        |
 | `SortLease`       | The admitted sort: its plan, private scratch directory, shared resource budgets and activity lifetime.  |
-| `SortSession`     | Push rows, `finish` into a `Stream` of values in key order. Spills and merges without caller involvement. |
+| `SortSession`     | Push rows, then borrow with `finish` to publish sorted values or await `abort` to clean up. |
+| `SortOutput`      | Sorted `Stream` with awaited `close` / `abort` for an unread suffix. |
 
 A nonzero estimate below the in-memory threshold starts without disk I/O.
 A zero-byte estimate means unknown size and selects a spill-capable plan.
@@ -120,6 +121,21 @@ large value with a small key can therefore require substantially more merge
 headroom than its own retained bytes. Full local runs are released eagerly;
 this does not guarantee admission when another buffer, live pressure, merge
 heads or codec working space exhausts the shared cap.
+
+### Awaited sort cleanup
+
+`session.finish().await` borrows the session. A failed or cancelled finish
+invalidates publication while retaining the original scratch owner, pending I/O,
+and admission lease. Call `session.abort().await?` before releasing that owner.
+A successful finish transfers ownership to `SortOutput`; the session cannot be
+reused. Dropping the now-empty session does not affect its published output.
+
+Output exhaustion awaits cleanup before EOF. For early termination or a stream
+error, call `output.close().await?` (or `output.abort().await?`) without draining
+remaining values. Cancelling either method preserves its cleanup state for a
+later call. Completion means pending original I/O has finished, scratch has been
+removed, and retained row charges and the admission lease have been released.
+Drop remains best-effort asynchronous cleanup and is not an awaited guarantee.
 
 ### Replaying rows
 
