@@ -17,9 +17,7 @@ fn scratch() -> (TempDir, PathBuf) {
     (dir, sort_dir)
 }
 
-async fn drain(
-    mut stream: crate::engine::merge::ValueStream<u32>,
-) -> Result<Vec<u32>, SorterError> {
+async fn drain(mut stream: crate::SortOutput<u32>) -> Result<Vec<u32>, SorterError> {
     let mut out = Vec::new();
     while let Some(item) = stream.next().await {
         out.push(item?);

@@ -29,7 +29,6 @@ use crate::engine::budget::{
     MemoryCharge,
     RunResources,
 };
-use crate::engine::cleanup::AsyncCleanupGuard;
 use crate::engine::operation::IoScope;
 use crate::engine::row::RunRow;
 use crate::engine::run::{
@@ -238,17 +237,12 @@ where
 }
 
 /// Fold `runs` down to `≤ fan_in` files, then stream the final merge.
-///
-/// `hold` is an opaque resource (typically the admission lease) kept alive
-/// for exactly as long as the output stream, so the fd permits backing this
-/// sort are released only once its results are fully consumed or dropped.
+/// The session retains cleanup ownership throughout this awaited setup.
 pub(crate) async fn cascade_and_stream<K, V>(
     mut runs: Vec<PathBuf>,
     fan_in: usize,
     dir: PathBuf,
-    guard: AsyncCleanupGuard,
     dedup: bool,
-    hold: Option<Box<dyn Send>>,
     resources: RunResources,
 ) -> Result<ValueStream<V>, SorterError>
 where
@@ -286,59 +280,23 @@ where
         pass += 1;
     }
     let state = MergeState::<K, V>::open(&runs, dedup, fds, budget, io).await?;
-    Ok(Box::pin(value_stream(state, guard, hold)))
+    Ok(value_stream(state))
 }
 
-/// What the value stream holds until it is fully consumed or dropped: the
-/// scratch-directory guard and the opaque admission lease.
-struct StreamHold {
-    scratch: AsyncCleanupGuard,
-    _resource: Option<Box<dyn Send>>,
-}
-
-impl StreamHold {
-    async fn cleanup(&mut self) -> Result<(), SorterError> {
-        self.scratch.cleanup().await
-    }
-}
-
-/// Drive a [`MergeState`] as a lazy value stream, keeping its scratch
-/// directory and resource lease alive for the stream's lifetime.
-fn value_stream<K, V>(
-    state: MergeState<K, V>,
-    scratch: AsyncCleanupGuard,
-    resource: Option<Box<dyn Send>>,
-) -> ValueStream<V>
+/// Drive merge rows; the public output owner holds cleanup separately.
+fn value_stream<K, V>(state: MergeState<K, V>) -> ValueStream<V>
 where
     K: Ord + Clone + DeserializeOwned + Send + 'static,
     V: DeserializeOwned + Send + 'static,
 {
-    let hold = StreamHold {
-        scratch,
-        _resource: resource,
-    };
-    Box::pin(stream::unfold(
-        (Some(state), hold, false),
-        |(maybe, mut hold, cleanup_reported)| async move {
-            let Some(mut state) = maybe else {
-                if cleanup_reported {
-                    return None;
-                }
-                return match hold.cleanup().await {
-                    Ok(()) => None,
-                    Err(err) => Some((Err(err), (None, hold, true))),
-                };
-            };
-            match state.next_row().await {
-                Ok(Some(row)) => Some((Ok(row.value), (Some(state), hold, false))),
-                Ok(None) => match hold.cleanup().await {
-                    Ok(()) => None,
-                    Err(err) => Some((Err(err), (None, hold, true))),
-                },
-                Err(err) => Some((Err(err), (None, hold, false))),
-            }
-        },
-    ))
+    Box::pin(stream::unfold(Some(state), |maybe| async move {
+        let mut state = maybe?;
+        match state.next_row().await {
+            Ok(Some(row)) => Some((Ok(row.value), Some(state))),
+            Ok(None) => None,
+            Err(error) => Some((Err(error), None)),
+        }
+    }))
 }
 
 #[cfg(test)]

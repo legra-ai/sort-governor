@@ -54,10 +54,6 @@ impl AsyncCleanupGuard {
         self.reservation = Some(Arc::new(reservation));
     }
 
-    pub(crate) fn take_reservation(&mut self) -> Option<Arc<MemoryCharge>> {
-        self.reservation.take()
-    }
-
     /// Point the guard at the scratch directory it must remove. Arming an
     /// already armed guard for the same sort is a no-op by construction —
     /// each sort has exactly one scratch directory.
@@ -68,10 +64,11 @@ impl AsyncCleanupGuard {
     /// Remove the directory now, in-band. Idempotent: the guard disarms
     /// itself so a later drop does nothing.
     pub(crate) async fn cleanup(&mut self) -> Result<(), SorterError> {
+        self.scope.idle().await;
         let Some(dir) = &self.dir else {
+            self.reservation = None;
             return Ok(());
         };
-        self.scope.idle().await;
         let fds = Arc::clone(
             self.fds
                 .as_ref()

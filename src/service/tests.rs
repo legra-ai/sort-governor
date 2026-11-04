@@ -24,7 +24,7 @@ fn spawn(fd_budget: u32, target: u64, resident: u64) -> (TempDir, SorterHandle) 
     (dir, handle)
 }
 
-async fn drain(mut stream: crate::engine::ValueStream<u32>) -> Vec<u32> {
+async fn drain(mut stream: crate::SortOutput<u32>) -> Vec<u32> {
     let mut out = Vec::new();
     while let Some(item) = stream.next().await {
         out.push(item.expect("stream item"));

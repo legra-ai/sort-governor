@@ -20,10 +20,10 @@ use crate::engine::budget::{
 };
 use crate::engine::cleanup::AsyncCleanupGuard;
 use crate::engine::merge::{
-    ValueStream,
     cascade_and_stream,
     merge_group_to_file,
 };
+use crate::engine::output::SortOutput;
 use crate::engine::row::RunRow;
 use crate::engine::run::RunWriter;
 use crate::error::SorterError;
@@ -33,6 +33,9 @@ mod buffer;
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod abort_tests;
 
 /// An in-progress sort. Generic over the ordering key `K` and payload `V`.
 pub struct SortSession<K, V> {
@@ -206,11 +209,13 @@ where
     }
 
     /// Finish the sort, returning a stream of values in key order.
+    /// A failed or cancelled finish retains ownership for [`Self::abort`].
+    /// Successful publication invalidates the session.
     ///
     /// # Errors
     ///
     /// Returns [`SorterError`] if a final spill or the merge setup fails.
-    pub async fn finish(mut self) -> Result<ValueStream<V>, SorterError> {
+    pub async fn finish(&mut self) -> Result<SortOutput<V>, SorterError> {
         self.ensure_usable()?;
         self.buffer.sort_unstable_by(|left, right| {
             left.key
@@ -228,8 +233,7 @@ where
         if !self.buffer.is_empty() {
             self.spill().await?;
         }
-        let hold: Option<Box<dyn Send>> = self.hold.take();
-        let guard = std::mem::take(&mut self.cleanup);
+        self.failed = true;
         // bounded: at most 64 frontier entries. Reverse levels to preserve
         // chronological run order, including the first row among equal keys.
         let spills = self
@@ -239,32 +243,50 @@ where
             .filter_map(Option::take)
             .collect();
         let dir = self.dir.clone();
-        let io = guard.scope();
-        cascade_and_stream::<K, V>(
+        let io = self.cleanup.scope();
+        let stream = cascade_and_stream::<K, V>(
             spills,
             fan_in.max(2),
             dir,
-            guard,
             self.dedup,
-            hold,
             RunResources::new(Arc::clone(&self.fds), Arc::clone(&self.budget), io),
         )
-        .await
+        .await?;
+        Ok(SortOutput::new(
+            stream,
+            std::mem::take(&mut self.cleanup),
+            self.hold.take(),
+        ))
+    }
+
+    /// Invalidate this session and await all original I/O and scratch cleanup.
+    /// Cancellation retains the owner; call again to finish cleanup.
+    ///
+    /// # Errors
+    /// Returns a filesystem error if scratch removal fails; cleanup can be
+    /// retried.
+    pub async fn abort(&mut self) -> Result<(), SorterError> {
+        self.failed = true;
+        self.buffer = Vec::new();
+        self.buffer_charge = None;
+        self.spills = std::array::from_fn(|_| None);
+        self.cleanup.cleanup().await?;
+        self.hold = None;
+        Ok(())
     }
 
     /// Stream the sorted in-memory buffer, collapsing equal keys when
     /// `dedup`. Used when nothing spilled — the buffer is bounded by the
     /// plan, so materializing its values here is safe. The resource hold
     /// rides the stream so its lease releases only when the stream ends.
-    fn in_memory_stream(&mut self) -> ValueStream<V> {
+    fn in_memory_stream(&mut self) -> SortOutput<V> {
+        self.failed = true;
         let rows = std::mem::take(&mut self.buffer).into_iter();
-        let hold = self.hold.take();
         let allocation = self.buffer_charge.take();
-        let metadata = self.cleanup.take_reservation();
         let dedup = self.dedup;
-        Box::pin(stream::unfold(
-            (rows, None, hold, allocation, metadata),
-            move |(mut rows, mut last, hold, allocation, metadata)| async move {
+        let stream = Box::pin(stream::unfold(
+            (rows, None, allocation),
+            move |(mut rows, mut last, allocation)| async move {
                 for row in rows.by_ref() {
                     if dedup && last.as_ref().is_some_and(|(key, _)| key == &row.key) {
                         continue;
@@ -272,11 +294,12 @@ where
                     if dedup {
                         last = Some((row.key, row.charge));
                     }
-                    return Some((Ok(row.value), (rows, last, hold, allocation, metadata)));
+                    return Some((Ok(row.value), (rows, last, allocation)));
                 }
                 None
             },
-        ))
+        ));
+        SortOutput::new(stream, std::mem::take(&mut self.cleanup), self.hold.take())
     }
 
     /// Sort and write the current buffer to a new run file.
