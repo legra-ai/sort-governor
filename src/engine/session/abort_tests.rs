@@ -199,3 +199,46 @@ fn cancelled_finish_and_output_close_retain_pending_filesystem_ownership() {
         root.remove().await.unwrap();
     });
 }
+
+#[test]
+fn cancelled_abort_during_directory_removal_can_be_resumed() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .max_blocking_threads(1)
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let root = async_fs_io::TempDir::create(std::env::temp_dir())
+            .await
+            .unwrap();
+        let mut session =
+            SortSession::<u32, u32>::with_temp_dir(SortPlan::InMemory, root.path(), false);
+        session.push(1, 7).await.unwrap();
+        session.spill().await.unwrap();
+        let budget = Arc::clone(&session.budget);
+        let scope = session.cleanup.scope();
+        let (ready, started) = oneshot::channel();
+        let (release, gate) = mpsc::channel();
+        let blocker = tokio::task::spawn_blocking(move || {
+            ready.send(()).unwrap();
+            gate.recv().unwrap();
+        });
+        started.await.unwrap();
+        {
+            let abort = session.abort();
+            tokio::pin!(abort);
+            assert!(
+                abort
+                    .as_mut()
+                    .poll(&mut Context::from_waker(Waker::noop()))
+                    .is_pending()
+            );
+        }
+        release.send(()).unwrap();
+        blocker.await.unwrap();
+        scope.idle().await;
+        session.abort().await.unwrap();
+        assert_eq!(budget.used(), 0);
+        root.remove().await.unwrap();
+    });
+}
