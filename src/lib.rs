@@ -14,6 +14,7 @@ pub use engine::{
     ReplayCursor,
     ReplayStep,
     ReplayWriter,
+    SortOutput,
     SortSession,
 };
 pub use error::SorterError;
