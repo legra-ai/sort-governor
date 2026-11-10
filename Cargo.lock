@@ -4,9 +4,9 @@ version = 4
 
 [[package]]
 name = "async-fs-io"
-version = "0.2.4"
+version = "0.2.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e6ce680f375cdb1379a8956e532db06ccca7d458fb7e9c86b7c2c0a5df514bc7"
+checksum = "1d2e5792ff14a3bd92125c08a3d61143a6851105961eca08b420b69cd298a001"
 dependencies = [
  "fs2",
  "thiserror",
@@ -204,9 +204,9 @@ checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 
 [[package]]
 name = "rhusky"
-version = "2.0.3"
+version = "2.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "55d5567ed9d191f2254a7ce32832b02e0fe617a295369a768da4085fb2569dec"
+checksum = "84cd1f1667fea8b462120848fe1fe8ffad31da0b9ea9cecaa09a4f971cc2219d"
 dependencies = [
  "async-fs-io",
  "tokio",
@@ -399,9 +399,9 @@ checksum = "a2c754d6c33795a1c324727428e5a7dedb5b06195f9890bdbcba760d3e246563"
 
 [[package]]
 name = "uuid"
-version = "1.29.0"
+version = "1.29.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4a0e2d11620c50695fe12bbbfde96b3477fe606e7284c22d505c12ce51214514"
+checksum = "4a06f08a856b009bc7bbaf7d3e79808595d032dd19074c0c2ef26e49e03e6bdc"
 dependencies = [
  "getrandom",
  "js-sys",
