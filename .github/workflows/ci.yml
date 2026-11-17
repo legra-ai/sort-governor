@@ -131,11 +131,11 @@ jobs:
           fetch-depth: 0
           ref: ${{ needs.prepare.outputs.revision }}
       - uses: actions-rust-lang/setup-rust-toolchain@v2
-      - uses: legra-ai/github-actions/.github/actions/tag-tested-release@main
+      - uses: legra-ai/github-actions/.github/actions/tag-tested-release@8cdaad621c581c2f59e5eb0dfafc05f635c12c0a
         with:
           version: ${{ needs.prepare.outputs.version }}
           revision: ${{ needs.prepare.outputs.revision }}
-      - uses: legra-ai/github-actions/.github/actions/generate-changelog@main
+      - uses: legra-ai/github-actions/.github/actions/generate-changelog@8cdaad621c581c2f59e5eb0dfafc05f635c12c0a
         with:
           revision: ${{ needs.prepare.outputs.revision }}
           output-file: CHANGELOG_RELEASE.md
@@ -145,7 +145,7 @@ jobs:
           target_commitish: ${{ needs.prepare.outputs.revision }}
           body_path: CHANGELOG_RELEASE.md
           draft: true
-      - uses: legra-ai/github-actions/.github/actions/publish-tested-crate@main
+      - uses: legra-ai/github-actions/.github/actions/publish-tested-crate@8cdaad621c581c2f59e5eb0dfafc05f635c12c0a
         with:
           crate: sort-governor
           version: ${{ needs.prepare.outputs.version }}
