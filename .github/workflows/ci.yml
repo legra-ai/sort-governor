@@ -80,6 +80,7 @@ jobs:
       # The authorized release writer: the organisation's GitHub App, minted
       # per run and scoped to this repository only.
       - uses: actions/create-github-app-token@v3
+        if: github.event_name != 'pull_request'
         id: writer
         with:
           app-id: ${{ secrets.RELEASE_WRITER_APP_ID }}
@@ -89,7 +90,7 @@ jobs:
       - uses: legra-ai/github-actions/.github/actions/prepare-cargo-release@8cdaad621c581c2f59e5eb0dfafc05f635c12c0a
         id: release
         with:
-          token: ${{ steps.writer.outputs.token }}
+          token: ${{ github.event_name == 'pull_request' && github.token || steps.writer.outputs.token }}
           breaking-change-bump: minor
 
   test:
