@@ -7,8 +7,6 @@
 //! final cascade receives at most 64 paths. Readers and head rows stay
 //! bounded by `fan_in`; file merges also hold one output writer.
 
-use std::cmp::Reverse;
-use std::collections::BinaryHeap;
 use std::path::{
     Path,
     PathBuf,
@@ -24,6 +22,7 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tokio::sync::Semaphore;
 
+use self::heap::SourceHeap;
 use crate::engine::budget::{
     MemoryBudget,
     MemoryCharge,
@@ -38,6 +37,8 @@ use crate::engine::run::{
 use crate::engine::work::OpenReader;
 use crate::error::SorterError;
 
+mod heap;
+
 /// A boxed value stream — the merge's public output shape.
 pub(crate) type ValueStream<V> = Pin<Box<dyn Stream<Item = Result<V, SorterError>> + Send>>;
 
@@ -46,7 +47,6 @@ pub(crate) type ValueStream<V> = Pin<Box<dyn Stream<Item = Result<V, SorterError
 struct MergeSource<K, V> {
     head: Option<RunRow<K, V>>,
     reader: RunReader<K, V>,
-    key_charge: Option<MemoryCharge>,
     _open: OpenReader,
 }
 
@@ -68,7 +68,6 @@ where
             Some(head) => Ok(Some(Self {
                 head: Some(head),
                 reader,
-                key_charge: None,
                 _open: open,
             })),
             None => Ok(None),
@@ -79,26 +78,21 @@ where
         self.head.as_ref().map(|row| &row.key)
     }
 
-    /// Return the buffered head and refill it from the run.
-    async fn take_head(&mut self) -> Result<RunRow<K, V>, SorterError> {
-        let row = self.head.take().expect("take_head on exhausted source");
+    /// Read the next head after the previous one left this source.
+    async fn refill(&mut self) -> Result<(), SorterError> {
+        debug_assert!(self.head.is_none(), "refill over a buffered head");
         self.head = self.reader.next_row().await?;
-        Ok(row)
+        Ok(())
     }
-}
-
-/// Heap key: smallest `(key, idx)` first under `Reverse`. Derived ordering
-/// compares `key` then `idx`, giving a deterministic tiebreak across runs.
-#[derive(PartialEq, Eq, PartialOrd, Ord)]
-struct HeapEntry<K> {
-    key: K,
-    idx: usize,
 }
 
 /// The running k-way merge over a fixed set of sources.
 struct MergeState<K, V> {
     sources: Vec<MergeSource<K, V>>,
-    heap: BinaryHeap<Reverse<HeapEntry<K>>>,
+    heap: SourceHeap,
+    /// Source whose head was emitted last; it is refilled on the next call,
+    /// after the caller has consumed and released the emitted row.
+    refill: Option<usize>,
     dedup: bool,
     last_key: Option<(K, MemoryCharge)>,
     budget: Arc<MemoryBudget>,
@@ -115,7 +109,7 @@ where
             .checked_mul(std::mem::size_of::<MergeSource<K, V>>())
             .ok_or(SorterError::RunLimit)?;
         let heap_bytes = capacity
-            .checked_mul(std::mem::size_of::<Reverse<HeapEntry<K>>>())
+            .checked_mul(std::mem::size_of::<usize>())
             .ok_or(SorterError::RunLimit)?;
         let arrays = budget.reserve(
             source_bytes
@@ -123,16 +117,16 @@ where
                 .ok_or(SorterError::RunLimit)?,
         )?;
         let sources = Vec::with_capacity(capacity);
-        let heap = BinaryHeap::with_capacity(capacity);
+        let heap = SourceHeap::with_capacity(capacity);
         assert_eq!(
             sources.capacity(),
             capacity,
             "exact source capacity reservation"
         );
-        assert_eq!(heap.capacity(), capacity, "exact heap capacity reservation");
         Ok(Self {
             sources,
             heap,
+            refill: None,
             dedup,
             last_key: None,
             budget,
@@ -149,7 +143,7 @@ where
     ) -> Result<Self, SorterError> {
         let mut state = Self::new(paths.len(), dedup, Arc::clone(&budget))?;
         for path in paths {
-            if let Some(mut source) = MergeSource::<K, V>::open(
+            if let Some(source) = MergeSource::<K, V>::open(
                 path,
                 Arc::clone(&fds),
                 Arc::clone(&budget),
@@ -157,39 +151,51 @@ where
             )
             .await?
             {
-                let index = state.sources.len();
-                if let Some(head) = &source.head {
-                    source.key_charge = Some(budget.reserve(head.retained_bytes)?);
-                    state.heap.push(Reverse(HeapEntry {
-                        key: head.key.clone(),
-                        idx: index,
-                    }));
-                }
                 state.sources.push(source);
+                state.enqueue(state.sources.len() - 1);
             }
         }
         Ok(state)
     }
 
+    /// Order sources by `(head key, index)`: equal keys keep run order.
+    fn head_less(sources: &[MergeSource<K, V>], left: usize, right: usize) -> bool {
+        match (sources[left].key(), sources[right].key()) {
+            (Some(a), Some(b)) => (a, left) < (b, right),
+            _ => unreachable!("only sources with a buffered head are queued"),
+        }
+    }
+
+    fn enqueue(&mut self, idx: usize) {
+        if self.sources[idx].head.is_some() {
+            let sources = &self.sources;
+            self.heap
+                .push(idx, |left, right| Self::head_less(sources, left, right));
+        }
+    }
+
     /// Emit the next row in key order, collapsing equal keys when `dedup`.
+    ///
+    /// The emitted row's source is refilled lazily on the following call, so
+    /// the caller's row and its successor are never charged at once.
     async fn next_row(&mut self) -> Result<Option<RunRow<K, V>>, SorterError> {
         loop {
-            let Some(Reverse(entry)) = self.heap.pop() else {
+            if let Some(idx) = self.refill.take() {
+                self.sources[idx].refill().await?;
+                self.enqueue(idx);
+            }
+            let sources = &self.sources;
+            let Some(idx) = self
+                .heap
+                .pop(|left, right| Self::head_less(sources, left, right))
+            else {
                 return Ok(None);
             };
-            let idx = entry.idx;
-            drop(entry.key);
-            self.sources[idx].key_charge = None;
-            let row = self.sources[idx].take_head().await?;
-            if let Some(head) = &self.sources[idx].head {
-                self.sources[idx].key_charge = Some(self.budget.reserve(head.retained_bytes)?);
-            }
-            if let Some(key) = self.sources[idx].key() {
-                self.heap.push(Reverse(HeapEntry {
-                    key: key.clone(),
-                    idx,
-                }));
-            }
+            let row = self.sources[idx]
+                .head
+                .take()
+                .expect("queued source has a head");
+            self.refill = Some(idx);
             if self.dedup {
                 if self
                     .last_key

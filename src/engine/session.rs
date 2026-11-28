@@ -170,7 +170,8 @@ where
         self.ensure_usable()?;
         self.reserve_metadata()?;
         let bytes = estimated_bytes.max(std::mem::size_of::<RunRow<K, V>>());
-        let charge = self.budget.reserve(bytes)?;
+        // Spill before admitting the incoming row, so the run being written
+        // and the row that does not fit beside it are never charged at once.
         if !self.buffer.is_empty()
             && self
                 .buffer_bytes
@@ -179,6 +180,7 @@ where
         {
             self.spill().await?;
         }
+        let charge = self.budget.reserve(bytes)?;
         self.grow_buffer()?;
         let mut row = RunRow::new(key, value);
         row.ordinal = self.next_row;

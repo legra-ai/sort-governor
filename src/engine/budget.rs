@@ -87,6 +87,20 @@ impl MemoryBudget {
         self.reserve(working)
     }
 
+    /// Transient working memory for one file read of `bytes`: at most two
+    /// buffer lengths inside Tokio's file plumbing plus small framing reads.
+    /// The destination buffer itself is charged separately by the caller.
+    pub(crate) fn reserve_read_buffers(
+        self: &Arc<Self>,
+        bytes: usize,
+    ) -> Result<MemoryCharge, SorterError> {
+        let working = bytes
+            .checked_mul(2)
+            .and_then(|size| size.checked_add(32))
+            .ok_or(SorterError::RunLimit)?;
+        self.reserve(working)
+    }
+
     pub(crate) fn reserve(self: &Arc<Self>, bytes: usize) -> Result<MemoryCharge, SorterError> {
         let bytes = u64::try_from(bytes).map_err(|_| SorterError::RunLimit)?;
         let mut previous = self.used();
