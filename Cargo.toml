@@ -55,3 +55,6 @@ pedantic = { level = "deny", priority = -1 }
 # normalization") for this crate's `async fn`s over `async-fs-io`. Stable
 # passes the lint clean. Re-enable once the compiler bug is fixed.
 large_futures = "allow"
+
+[patch.crates-io]
+async-fs-io = { path = "../async-fs-io-perf" }

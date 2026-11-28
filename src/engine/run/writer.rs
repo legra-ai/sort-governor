@@ -1,10 +1,8 @@
 //! Buffered run writer: frames are packed into one charged chunk per append.
 
-use std::io::SeekFrom;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use async_fs_io::AsyncFile;
 use serde::Serialize;
 use tokio::sync::Semaphore;
 
@@ -74,9 +72,7 @@ impl RunWriter {
             Arc::clone(&budget),
             output.capacity(),
             async move {
-                let mut file = AsyncFile::create(&output).await?;
-                file.write_all(&0u64.to_le_bytes()).await?;
-                file.flush().await?;
+                async_fs_io::create_with_bytes(&output, 0u64.to_le_bytes().to_vec()).await?;
                 Ok(())
             },
         )
@@ -147,8 +143,6 @@ impl RunWriter {
         let Some(chunk) = self.pending.take() else {
             return Ok(());
         };
-        // bounded: Tokio's file buffer copies at most one chunk per write.
-        let copy = self.budget.reserve(chunk.bytes.len())?;
         let path = self.path.clone();
         perform(
             Arc::clone(&self.fds),
@@ -156,11 +150,12 @@ impl RunWriter {
             Arc::clone(&self.budget),
             path.capacity(),
             async move {
-                let _copy = copy;
-                let mut file = AsyncFile::open_append(&path).await?;
-                file.write_all(&chunk.bytes).await?;
-                file.flush().await?;
-                drop(chunk);
+                let PendingChunk {
+                    bytes,
+                    _charge: charge,
+                } = chunk;
+                async_fs_io::append_bytes(&path, bytes).await?;
+                drop(charge);
                 Ok(())
             },
         )
@@ -177,10 +172,7 @@ impl RunWriter {
             Arc::clone(&self.budget),
             path.capacity(),
             async move {
-                let mut file = AsyncFile::open_write_at_end(&path).await?;
-                file.seek(SeekFrom::Start(0)).await?;
-                file.write_all(&count.to_le_bytes()).await?;
-                file.flush().await?;
+                async_fs_io::write_bytes_at(&path, 0, count.to_le_bytes().to_vec()).await?;
                 Ok(())
             },
         )

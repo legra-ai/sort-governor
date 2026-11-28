@@ -1,13 +1,11 @@
 //! Buffered run reader: one positioned read serves many decoded frames.
 
-use std::io::SeekFrom;
 use std::path::{
     Path,
     PathBuf,
 };
 use std::sync::Arc;
 
-use async_fs_io::AsyncFile;
 use serde::de::DeserializeOwned;
 use tokio::sync::Semaphore;
 
@@ -61,10 +59,10 @@ impl<K: DeserializeOwned, V: DeserializeOwned> RunReader<K, V> {
             Arc::clone(&budget),
             input.capacity(),
             async move {
-                let mut file = AsyncFile::open(&input).await?;
-                let mut count = [0; 8];
-                file.read_exact(&mut count).await?;
-                Ok(u64::from_le_bytes(count))
+                let count = async_fs_io::read_bytes_at(&input, 0, 8, 8).await?;
+                Ok(u64::from_le_bytes(
+                    count[..8].try_into().expect("u64 count"),
+                ))
             },
         )
         .await?;
@@ -159,7 +157,8 @@ impl<K: DeserializeOwned, V: DeserializeOwned> RunReader<K, V> {
         } else {
             needed
         };
-        let charge = self.budget.reserve_frame(target)?;
+        // bounded: one exact read buffer; no runtime-side copy remains.
+        let charge = self.budget.reserve(target)?;
         let path = self.path.clone();
         let offset = self.offset;
         let bytes = perform(
@@ -167,17 +166,7 @@ impl<K: DeserializeOwned, V: DeserializeOwned> RunReader<K, V> {
             Arc::clone(&self.io),
             Arc::clone(&self.budget),
             path.capacity(),
-            async move {
-                let mut file = AsyncFile::open(&path).await?;
-                let on_disk = file.metadata().await?.len().saturating_sub(offset);
-                let size = usize::try_from(on_disk)
-                    .map_or(target, |on_disk| on_disk.min(target))
-                    .max(needed);
-                file.seek(SeekFrom::Start(offset)).await?;
-                let mut bytes = vec![0; size];
-                file.read_exact(&mut bytes).await?;
-                Ok(bytes)
-            },
+            async move { Ok(async_fs_io::read_bytes_at(&path, offset, needed, target).await?) },
         )
         .await?;
         Ok(ReadChunk {
