@@ -9,6 +9,12 @@ use std::sync::atomic::{
 use crate::error::SorterError;
 use crate::service::MemoryPressure;
 
+/// Largest batched run read or append.
+const MAX_IO_CHUNK_BYTES: usize = 1024 * 1024;
+
+/// Fraction of current headroom one run I/O chunk may claim.
+const IO_CHUNK_HEADROOM_SHARE: u64 = 16;
+
 pub(crate) struct MemoryBudget {
     limit: u64,
     pressure: Option<Arc<dyn MemoryPressure>>,
@@ -55,13 +61,25 @@ impl MemoryBudget {
         self.peak.load(Ordering::Acquire)
     }
 
+    /// Size one run I/O chunk: at least `minimum` (one whole frame), at most
+    /// [`MAX_IO_CHUNK_BYTES`], and otherwise a small slice of the current
+    /// headroom so many open merge sources shrink their chunks under pressure.
+    pub(crate) fn io_chunk_bytes(&self, minimum: usize) -> usize {
+        let headroom = self.limit().saturating_sub(self.used()) / IO_CHUNK_HEADROOM_SHARE;
+        usize::try_from(headroom)
+            .unwrap_or(usize::MAX)
+            .min(MAX_IO_CHUNK_BYTES)
+            .max(minimum)
+    }
+
     pub(crate) fn reserve_frame(
         self: &Arc<Self>,
         bytes: usize,
     ) -> Result<MemoryCharge, SorterError> {
         // bounded: our exact-sized frame plus at most two frame lengths for
         // Tokio's private file buffer capacity, with small framing reads.
-        // Files are reopened per operation, so no historical capacity remains.
+        // Files are reopened per chunk operation, so no historical capacity
+        // remains.
         let working = bytes
             .checked_mul(3)
             .and_then(|size| size.checked_add(32))

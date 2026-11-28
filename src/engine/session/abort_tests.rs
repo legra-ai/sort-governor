@@ -7,6 +7,7 @@ use std::sync::{
 };
 use std::task::{
     Context,
+    Poll,
     Waker,
 };
 
@@ -100,6 +101,9 @@ async fn failed_finish_keeps_original_scratch_until_abort() {
     root.remove().await.unwrap();
 }
 
+/// Rows whose run outgrows one maximal batched read chunk.
+const OWNERSHIP_ROWS: u32 = 40_000;
+
 #[test]
 fn cancelled_finish_and_output_close_retain_pending_filesystem_ownership() {
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -116,8 +120,11 @@ fn cancelled_finish_and_output_close_retain_pending_filesystem_ownership() {
             let mut session =
                 SortSession::<u32, u32>::with_temp_dir(SortPlan::InMemory, root.path(), false)
                     .hold_resource(Box::new(Arc::clone(&lease)));
-            session.push(1, 7).await.unwrap();
-            session.push(2, 8).await.unwrap();
+            // Enough rows to span several batched read chunks, so draining
+            // the output reaches a poll that waits on actual run I/O.
+            for key in 0..OWNERSHIP_ROWS {
+                session.push(key, key).await.unwrap();
+            }
             session.spill().await.unwrap();
             let budget = Arc::clone(&session.budget);
             let fds = Arc::clone(&session.fds);
@@ -136,14 +143,14 @@ fn cancelled_finish_and_output_close_retain_pending_filesystem_ownership() {
             });
             started.await.unwrap();
             if let Some(output) = &mut output {
-                {
+                loop {
                     let next = output.next();
                     tokio::pin!(next);
-                    assert!(
-                        next.as_mut()
-                            .poll(&mut Context::from_waker(Waker::noop()))
-                            .is_pending()
-                    );
+                    match next.as_mut().poll(&mut Context::from_waker(Waker::noop())) {
+                        Poll::Ready(Some(Ok(_))) => {}
+                        Poll::Pending => break,
+                        Poll::Ready(other) => panic!("output ended before chunk I/O: {other:?}"),
+                    }
                 }
                 {
                     let close = output.close();

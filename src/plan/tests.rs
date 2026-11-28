@@ -142,3 +142,24 @@ fn from_fd_limit_caps_fan_in_below_the_limit() {
         SortPlan::InMemory => panic!("must spill"),
     }
 }
+
+#[test]
+fn unknown_size_run_buffer_grows_with_free_memory_and_shares_it() {
+    let run_buffer = |snap: &SorterSnapshot| match plan(&SortSpec::new(0, 0), snap) {
+        SortPlan::External {
+            run_buffer_bytes, ..
+        } => run_buffer_bytes as u64,
+        SortPlan::InMemory => panic!("unknown size always spills"),
+    };
+    assert_eq!(run_buffer(&SorterSnapshot::new(GIB, 0, 1_000, 0)), GIB / 8);
+    assert_eq!(
+        run_buffer(&SorterSnapshot::new(GIB, 0, 1_000, 3)),
+        GIB / 32,
+        "concurrent external sorts share free memory"
+    );
+    assert_eq!(
+        run_buffer(&SorterSnapshot::new(4 * MIB, 0, 1_000, 0)),
+        MIB,
+        "small pools keep the configured minimum run"
+    );
+}
