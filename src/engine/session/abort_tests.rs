@@ -83,7 +83,7 @@ async fn failed_finish_keeps_original_scratch_until_abort() {
             .hold_resource(Box::new(Arc::clone(&lease)));
     session.push(1, 7).await.unwrap();
     session.spill().await.unwrap();
-    let run = session.spills.iter().flatten().next().unwrap().clone();
+    let run = session.spills.first().unwrap().0.clone();
     async_fs_io::remove_if_exists(run).await.unwrap();
     let budget = Arc::clone(&session.budget);
     let path = session.dir.clone();

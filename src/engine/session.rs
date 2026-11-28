@@ -31,6 +31,16 @@ use crate::plan::SortPlan;
 
 mod buffer;
 
+/// Most runs the ingestion frontier retains before forcing a merge.
+const MAX_FRONTIER: usize = 64;
+
+fn carry_cap() -> usize {
+    std::env::var("SG_CARRY")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(8)
+}
+
 #[cfg(test)]
 mod tests;
 
@@ -49,9 +59,10 @@ pub struct SortSession<K, V> {
     dedup: bool,
     buffer: Vec<RunRow<K, V>>,
     buffer_bytes: usize,
-    // bounded: one run per bit in the checked u64 spill count. Level n
-    // contains 2^n consecutive original runs; higher levels are older.
-    spills: [Option<PathBuf>; u64::BITS as usize],
+    // bounded: at most `MAX_FRONTIER` runs, oldest first. Each entry is a
+    // run of consecutive original runs with its merge level; levels never
+    // increase toward the end, so equal keys keep chronological order.
+    spills: Vec<(PathBuf, u32)>,
     next_run: u64,
     failed: bool,
     hold: Option<Box<dyn Send>>,
@@ -88,7 +99,7 @@ where
             dedup,
             buffer: Vec::new(),
             buffer_bytes: 0,
-            spills: std::array::from_fn(|_| None),
+            spills: Vec::new(),
             next_run: 0,
             failed: false,
             hold: None,
@@ -236,11 +247,9 @@ where
         self.failed = true;
         // bounded: at most 64 frontier entries. Reverse levels to preserve
         // chronological run order, including the first row among equal keys.
-        let spills = self
-            .spills
-            .iter_mut()
-            .rev()
-            .filter_map(Option::take)
+        let spills = std::mem::take(&mut self.spills)
+            .into_iter()
+            .map(|(path, _)| path)
             .collect();
         let dir = self.dir.clone();
         let io = self.cleanup.scope();
@@ -269,7 +278,7 @@ where
         self.failed = true;
         self.buffer = Vec::new();
         self.buffer_charge = None;
-        self.spills = std::array::from_fn(|_| None);
+        self.spills = Vec::new();
         self.cleanup.cleanup().await?;
         self.hold = None;
         Ok(())
@@ -341,22 +350,37 @@ where
         for row in &self.buffer {
             writer.write_row(row).await?;
         }
-        let mut run = writer.finish().await?;
+        let run = writer.finish().await?;
         self.buffer = Vec::new();
         self.buffer_charge = None;
         self.buffer_bytes = 0;
-        for (level, slot) in self.spills.iter_mut().enumerate() {
-            let Some(older) = slot.take() else {
-                *slot = Some(run);
-                self.failed = false;
-                return Ok(());
+        if self.spills.capacity() == 0 {
+            self.spills.reserve_exact(MAX_FRONTIER + 1);
+        }
+        self.spills.push((run, 0));
+        let fan = self.carry_fan_in();
+        let mut merge = 0u32;
+        loop {
+            let len = self.spills.len();
+            let level = self.spills[len - 1].1;
+            let full = len >= fan && self.spills[len - fan..].iter().all(|(_, l)| *l == level);
+            let take = if full {
+                fan
+            } else if len > MAX_FRONTIER {
+                fan.min(len)
+            } else {
+                break;
             };
+            // bounded: at most `fan` adjacent runs, oldest first.
+            let group: Vec<(PathBuf, u32)> = self.spills.drain(len - take..).collect();
+            let next_level = group.iter().map(|(_, l)| *l).max().unwrap_or(0) + u32::from(full);
+            let paths: Vec<PathBuf> = group.into_iter().map(|(path, _)| path).collect();
             let output = self
                 .dir
-                .join(format!("carry-{ordinal:020}-{level:02}.cbor"));
-            // bounded: two adjacent runs, older first for stable equal keys.
-            run = merge_group_to_file::<K, V>(
-                &[older, run],
+                .join(format!("carry-{ordinal:020}-{merge:02}.cbor"));
+            merge += 1;
+            let merged = merge_group_to_file::<K, V>(
+                &paths,
                 output,
                 false,
                 Arc::clone(&self.fds),
@@ -364,8 +388,20 @@ where
                 self.cleanup.scope(),
             )
             .await?;
+            self.spills.push((merged, next_level));
         }
-        unreachable!("a checked u64 spill count always fits in 64 frontier levels")
+        self.failed = false;
+        Ok(())
+    }
+
+    /// Runs merged per frontier carry: the plan's fan-in, capped so one
+    /// carry's open readers stay small.
+    fn carry_fan_in(&self) -> usize {
+        let fan = match self.plan {
+            SortPlan::InMemory => 2,
+            SortPlan::External { max_fan_in, .. } => max_fan_in as usize,
+        };
+        fan.clamp(2, carry_cap())
     }
 
     fn ensure_usable(&self) -> Result<(), SorterError> {
