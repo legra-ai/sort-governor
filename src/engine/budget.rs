@@ -61,27 +61,31 @@ impl MemoryBudget {
         self.peak.load(Ordering::Acquire)
     }
 
+    /// Bytes still admissible under the current limit.
+    pub(crate) fn headroom(&self) -> u64 {
+        self.limit().saturating_sub(self.used())
+    }
+
     /// Size one run I/O chunk: at least `minimum` (one whole frame), at most
     /// [`MAX_IO_CHUNK_BYTES`], and otherwise a small slice of the current
     /// headroom so many open merge sources shrink their chunks under pressure.
     pub(crate) fn io_chunk_bytes(&self, minimum: usize) -> usize {
-        let headroom = self.limit().saturating_sub(self.used()) / IO_CHUNK_HEADROOM_SHARE;
+        let headroom = self.headroom() / IO_CHUNK_HEADROOM_SHARE;
         usize::try_from(headroom)
             .unwrap_or(usize::MAX)
             .min(MAX_IO_CHUNK_BYTES)
             .max(minimum)
     }
 
-    pub(crate) fn reserve_frame(
+    /// Transient working memory for one file read of `bytes`: at most two
+    /// buffer lengths inside Tokio's file plumbing plus small framing reads.
+    /// The destination buffer itself is charged separately by the caller.
+    pub(crate) fn reserve_read_buffers(
         self: &Arc<Self>,
         bytes: usize,
     ) -> Result<MemoryCharge, SorterError> {
-        // bounded: our exact-sized frame plus at most two frame lengths for
-        // Tokio's private file buffer capacity, with small framing reads.
-        // Files are reopened per chunk operation, so no historical capacity
-        // remains.
         let working = bytes
-            .checked_mul(3)
+            .checked_mul(2)
             .and_then(|size| size.checked_add(32))
             .ok_or(SorterError::RunLimit)?;
         self.reserve(working)

@@ -33,24 +33,24 @@ struct PendingChunk {
 }
 
 impl PendingChunk {
-    /// Encode one frame in place. `false` (chunk unchanged) when it does not
-    /// fit the remaining charged capacity.
-    fn append<T: Serialize>(&mut self, row: &T, weight: u64) -> Result<bool, SorterError> {
+    /// Encode one frame in place and return its length. `None` (chunk
+    /// unchanged) when it does not fit the remaining charged capacity.
+    fn append<T: Serialize>(&mut self, row: &T, weight: u64) -> Result<Option<usize>, SorterError> {
         let start = self.bytes.len();
         if self.bytes.capacity() - start < FRAME_HEADER_BYTES {
-            return Ok(false);
+            return Ok(None);
         }
         self.bytes.extend_from_slice(&[0; FRAME_HEADER_BYTES]);
         let body = start + FRAME_HEADER_BYTES;
         if !codec::encode_into(row, &mut self.bytes)? {
             self.bytes.truncate(start);
-            return Ok(false);
+            return Ok(None);
         }
         let len = u32::try_from(self.bytes.len() - body)
             .map_err(|error| SorterError::Encode(error.to_string()))?;
         self.bytes[start..start + 4].copy_from_slice(&len.to_le_bytes());
         self.bytes[start + 4..body].copy_from_slice(&weight.to_le_bytes());
-        Ok(true)
+        Ok(Some(self.bytes.len() - start))
     }
 }
 
@@ -59,6 +59,7 @@ pub(crate) struct RunWriter {
     path: PathBuf,
     count: u64,
     pending: Option<PendingChunk>,
+    heaviest_frame: usize,
     budget: Arc<MemoryBudget>,
     io: Arc<IoScope>,
 }
@@ -90,6 +91,7 @@ impl RunWriter {
             path,
             count: 0,
             pending: None,
+            heaviest_frame: 0,
             budget,
             io,
         })
@@ -109,8 +111,8 @@ impl RunWriter {
                 self.pending = Some(self.open_chunk(FRAME_HEADER_BYTES + 1)?);
             }
             let chunk = self.pending.as_mut().expect("pending chunk");
-            if chunk.append(row, weight)? {
-                self.count = self.count.checked_add(1).ok_or(SorterError::RunLimit)?;
+            if let Some(frame) = chunk.append(row, weight)? {
+                self.appended(frame)?;
                 return Ok(());
             }
             if chunk.bytes.is_empty() {
@@ -125,14 +127,24 @@ impl RunWriter {
             .ok_or(SorterError::RunLimit)?;
         self.pending = None;
         let mut chunk = self.open_chunk(frame)?;
-        if !chunk.append(row, weight)? {
+        let Some(frame) = chunk.append(row, weight)? else {
             return Err(SorterError::Encode(
                 "serialization changed between sizing and encoding".into(),
             ));
-        }
+        };
         self.pending = Some(chunk);
+        self.appended(frame)
+    }
+
+    fn appended(&mut self, frame: usize) -> Result<(), SorterError> {
+        self.heaviest_frame = self.heaviest_frame.max(frame);
         self.count = self.count.checked_add(1).ok_or(SorterError::RunLimit)?;
         Ok(())
+    }
+
+    /// Largest frame, header included, written to this run so far.
+    pub(crate) fn heaviest_frame(&self) -> usize {
+        self.heaviest_frame
     }
 
     fn open_chunk(&self, minimum: usize) -> Result<PendingChunk, SorterError> {

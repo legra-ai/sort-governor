@@ -129,7 +129,7 @@ impl<K: DeserializeOwned, V: DeserializeOwned> RunReader<K, V> {
             .checked_add(u64::try_from(frame).map_err(|_| SorterError::RunLimit)?)
             .ok_or(SorterError::RunLimit)?;
         self.remaining -= 1;
-        if self.remaining == 0 {
+        if self.remaining == 0 || chunk.available().is_empty() {
             self.chunk = None;
         }
         row.retained_bytes = retained_bytes;
@@ -160,7 +160,10 @@ impl<K: DeserializeOwned, V: DeserializeOwned> RunReader<K, V> {
         } else {
             needed
         };
-        let charge = self.budget.reserve_frame(target)?;
+        // The chunk stays charged while frames decode from it; Tokio's
+        // private file-buffer copies exist only during the read itself.
+        let charge = self.budget.reserve(target)?;
+        let transient = self.budget.reserve_read_buffers(target)?;
         let path = self.path.clone();
         let offset = self.offset;
         let bytes = perform(
@@ -169,6 +172,7 @@ impl<K: DeserializeOwned, V: DeserializeOwned> RunReader<K, V> {
             Arc::clone(&self.budget),
             path.capacity(),
             async move {
+                let _transient = transient;
                 let mut file = AsyncFile::open(&path).await?;
                 let on_disk = file.metadata().await?.len().saturating_sub(offset);
                 let size = usize::try_from(on_disk)
