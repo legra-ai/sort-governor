@@ -12,6 +12,7 @@ mod replay;
 mod row;
 mod run;
 mod session;
+mod work;
 
 #[cfg(test)]
 mod tests;
@@ -24,3 +25,5 @@ pub use replay::{
     ReplayWriter,
 };
 pub use session::SortSession;
+#[cfg(any(test, feature = "work-stats"))]
+pub use work::WorkStats;

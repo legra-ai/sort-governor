@@ -73,6 +73,14 @@ impl<V> Replay<V> {
         ReplayCursor::new(Arc::clone(&self.inner))
     }
 
+    /// Work recorded by the writer and every cursor of this replay so far.
+    #[cfg(any(test, feature = "work-stats"))]
+    #[doc(hidden)]
+    #[must_use]
+    pub fn work_stats(&self) -> crate::engine::work::WorkStats {
+        self.inner.scope.work().snapshot()
+    }
+
     /// Finish cleanup in-band after dropping every cursor/checkpoint.
     ///
     /// # Errors

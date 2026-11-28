@@ -23,6 +23,9 @@ use crate::error::SorterError;
 /// Frame header: u32 encoded length then u64 retained weight.
 pub(super) const FRAME_HEADER_BYTES: usize = 12;
 
+/// Leading u64 row count of every run file.
+const COUNT_BYTES: usize = 8;
+
 /// Pending frames awaiting one append, with the charge for its capacity.
 struct PendingChunk {
     bytes: Vec<u8>,
@@ -59,6 +62,7 @@ impl RunWriter {
             },
         )
         .await?;
+        io.work().wrote(COUNT_BYTES);
         Ok(Self {
             fds,
             path,
@@ -116,6 +120,7 @@ impl RunWriter {
         };
         // bounded: Tokio's file buffer copies at most one chunk per write.
         let copy = self.budget.reserve(chunk.bytes.len())?;
+        let written = chunk.bytes.len();
         let path = self.path.clone();
         perform(
             Arc::clone(&self.fds),
@@ -131,13 +136,16 @@ impl RunWriter {
                 Ok(())
             },
         )
-        .await
+        .await?;
+        self.io.work().wrote(written);
+        Ok(())
     }
 
     pub(crate) async fn finish(mut self) -> Result<PathBuf, SorterError> {
         self.flush().await?;
         let path = self.path.clone();
         let count = self.count;
+        self.io.work().wrote(COUNT_BYTES);
         perform(
             self.fds,
             self.io,

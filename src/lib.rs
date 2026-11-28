@@ -9,6 +9,9 @@ mod snapshot;
 mod spec;
 
 pub use config::SorterConfig;
+#[cfg(any(test, feature = "work-stats"))]
+#[doc(hidden)]
+pub use engine::WorkStats;
 pub use engine::{
     Replay,
     ReplayCursor,
