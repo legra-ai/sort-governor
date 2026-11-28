@@ -8,6 +8,7 @@ use std::path::{
 };
 use std::sync::Arc;
 
+use frontier::SpillFrontier;
 use futures_util::stream;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -30,8 +31,7 @@ use crate::error::SorterError;
 use crate::plan::SortPlan;
 
 mod buffer;
-#[cfg(any(test, feature = "work-stats"))]
-mod work;
+mod frontier;
 
 #[cfg(test)]
 mod tests;
@@ -51,9 +51,7 @@ pub struct SortSession<K, V> {
     dedup: bool,
     buffer: Vec<RunRow<K, V>>,
     buffer_bytes: usize,
-    // bounded: one run per bit in the checked u64 spill count. Level n
-    // contains 2^n consecutive original runs; higher levels are older.
-    spills: [Option<PathBuf>; u64::BITS as usize],
+    spills: SpillFrontier,
     next_run: u64,
     failed: bool,
     hold: Option<Box<dyn Send>>,
@@ -90,7 +88,7 @@ where
             dedup,
             buffer: Vec::new(),
             buffer_bytes: 0,
-            spills: std::array::from_fn(|_| None),
+            spills: SpillFrontier::new(plan),
             next_run: 0,
             failed: false,
             hold: None,
@@ -236,14 +234,10 @@ where
             self.spill().await?;
         }
         self.failed = true;
-        // bounded: at most 64 frontier entries. Reverse levels to preserve
-        // chronological run order, including the first row among equal keys.
-        let spills = self
-            .spills
-            .iter_mut()
-            .rev()
-            .filter_map(Option::take)
-            .collect();
+        // bounded: at most 64 frontier entries, oldest first, so equal keys
+        // keep chronological order, including the first row among them.
+        let spills =
+            std::mem::replace(&mut self.spills, SpillFrontier::new(self.plan)).into_paths();
         let dir = self.dir.clone();
         let io = self.cleanup.scope();
         let stream = cascade_and_stream::<K, V>(
@@ -271,7 +265,7 @@ where
         self.failed = true;
         self.buffer = Vec::new();
         self.buffer_charge = None;
-        self.spills = std::array::from_fn(|_| None);
+        self.spills = SpillFrontier::new(self.plan);
         self.cleanup.cleanup().await?;
         self.hold = None;
         Ok(())
@@ -343,24 +337,21 @@ where
         for row in &self.buffer {
             writer.write_row(row).await?;
         }
-        let mut run = writer.finish().await?;
+        let run = writer.finish().await?;
         self.cleanup.scope().work().run_spilled();
         self.buffer = Vec::new();
         self.buffer_charge = None;
         self.buffer_bytes = 0;
-        for (level, slot) in self.spills.iter_mut().enumerate() {
-            let Some(older) = slot.take() else {
-                *slot = Some(run);
-                self.failed = false;
-                return Ok(());
-            };
+        self.spills.push(run);
+        let mut merge = 0u32;
+        while let Some(carry) = self.spills.next_carry() {
             let output = self
                 .dir
-                .join(format!("carry-{ordinal:020}-{level:02}.cbor"));
-            // bounded: two adjacent runs, older first for stable equal keys.
+                .join(format!("carry-{ordinal:020}-{merge:02}.cbor"));
+            merge += 1;
             self.cleanup.scope().work().carry_merge();
-            run = merge_group_to_file::<K, V>(
-                &[older, run],
+            let merged = merge_group_to_file::<K, V>(
+                carry.paths(),
                 output,
                 false,
                 Arc::clone(&self.fds),
@@ -368,8 +359,10 @@ where
                 self.cleanup.scope(),
             )
             .await?;
+            self.spills.settle(carry, merged);
         }
-        unreachable!("a checked u64 spill count always fits in 64 frontier levels")
+        self.failed = false;
+        Ok(())
     }
 
     fn ensure_usable(&self) -> Result<(), SorterError> {

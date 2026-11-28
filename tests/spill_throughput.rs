@@ -77,6 +77,7 @@ async fn unknown_size_spill_of_twenty_thousand_rows_stays_well_under_a_second() 
     let session = SortSession::with_temp_dir(plan, root.path(), true)
         .with_memory_limit_bytes(SESSION_LIMIT_BYTES);
     let elapsed = sort_rows(session).await;
+    println!("{ROWS} planned rows: {elapsed:?}");
     assert!(
         elapsed < PLANNED_CEILING,
         "{ROWS} rows took {elapsed:?}, ceiling {PLANNED_CEILING:?}"
@@ -96,6 +97,7 @@ async fn minimum_run_buffer_spills_do_not_pay_file_io_per_row() {
     let session = SortSession::with_temp_dir(plan, root.path(), true)
         .with_memory_limit_bytes(SESSION_LIMIT_BYTES);
     let elapsed = sort_rows(session).await;
+    println!("{ROWS} rows over 1 MiB runs: {elapsed:?}");
     assert!(
         elapsed < MINIMUM_RUN_CEILING,
         "{ROWS} rows over 1 MiB runs took {elapsed:?}, ceiling {MINIMUM_RUN_CEILING:?}"

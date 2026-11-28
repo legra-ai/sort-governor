@@ -30,6 +30,8 @@ const ROWS_PER_OP: u64 = 100;
 const OPS_PER_RUN: u64 = 4;
 /// Fixed operations per sort (cleanup and the final merge setup).
 const FIXED_OPS: u64 = 16;
+/// Widest spill-frontier carry merge the engine performs.
+const MAX_CARRY_FAN_IN: u64 = 16;
 
 /// One spilling sort over `rows` distinct keys pushed in reverse order.
 struct Workload {
@@ -106,28 +108,60 @@ impl Workload {
             SortPlan::InMemory => unreachable!("workloads spill"),
         }
     }
+
+    /// Runs merged per frontier carry: the plan's fan-in, capped.
+    fn carry_fan_in(&self) -> u64 {
+        self.fan_in().clamp(2, MAX_CARRY_FAN_IN)
+    }
 }
 
 /// Bounds derived from one sort's recorded work.
 trait WorkBounds {
-    /// Spilled runs left on the binary-carry frontier handed to the cascade.
-    fn frontier(&self) -> u64;
+    /// Spilled runs left on the frontier handed to the cascade: the digit
+    /// sum of the run count in base `carry`, since `carry` equal-level runs
+    /// merge into one a level up (exact while it stays below 64 runs).
+    fn frontier(&self, carry: u64) -> u64;
+    /// Carry merges: each folds `carry` runs into one.
+    fn carries(&self, carry: u64) -> u64;
+    /// Frontier levels: base-`carry` digits of the run count. Carries
+    /// rewrite each original run at most once per level.
+    fn levels(&self, carry: u64) -> u64;
     /// Smallest `p` with `fan_in^p >= frontier`.
-    fn frontier_depth(&self, fan_in: u64) -> u64;
+    fn frontier_depth(&self, carry: u64, fan_in: u64) -> u64;
     /// Every byte written is read back once by its merge (times the passes
     /// as slack); each refill re-reads at most one frame tail.
     fn assert_reads_bounded(&self);
 }
 
 impl WorkBounds for WorkStats {
-    fn frontier(&self) -> u64 {
-        u64::from(self.runs_spilled.count_ones())
+    fn frontier(&self, carry: u64) -> u64 {
+        let mut runs = self.runs_spilled;
+        let mut digits = 0;
+        while runs > 0 {
+            digits += runs % carry;
+            runs /= carry;
+        }
+        digits
     }
 
-    fn frontier_depth(&self, fan_in: u64) -> u64 {
+    fn carries(&self, carry: u64) -> u64 {
+        (self.runs_spilled - self.frontier(carry)) / (carry - 1)
+    }
+
+    fn levels(&self, carry: u64) -> u64 {
+        let mut runs = self.runs_spilled;
+        let mut levels = 0;
+        while runs > 0 {
+            runs /= carry;
+            levels += 1;
+        }
+        levels
+    }
+
+    fn frontier_depth(&self, carry: u64, fan_in: u64) -> u64 {
         let mut depth = 0;
         let mut covered = 1u64;
-        while covered < self.frontier() {
+        while covered < self.frontier(carry) {
             covered = covered.saturating_mul(fan_in);
             depth += 1;
         }
@@ -148,9 +182,12 @@ async fn twenty_thousand_rows_at_minimum_runs_pay_chunks_not_rows() {
     let bound = workload.pushes() / ROWS_PER_OP + OPS_PER_RUN * stats.runs_spilled + FIXED_OPS;
     assert!(stats.runs_spilled > 1, "{stats:?} must spill several runs");
     assert!(stats.perform_ops <= bound, "{stats:?} op bound {bound}");
-    // Carries rewrite each original run at most once per frontier level.
-    let levels = u64::from(u64::BITS - stats.runs_spilled.leading_zeros());
-    let written = workload.pushes() * (PAYLOAD_BYTES as u64 + FRAME_OVERHEAD_BYTES) * (levels + 1);
+    // Carries rewrite each original run at most once per frontier level:
+    // log_16 of the run count, not log_2.
+    let carry = workload.carry_fan_in();
+    assert_eq!(stats.carry_merges, stats.carries(carry), "{stats:?}");
+    let levels = stats.levels(carry);
+    let written = workload.pushes() * (PAYLOAD_BYTES as u64 + FRAME_OVERHEAD_BYTES) * levels;
     assert!(
         stats.bytes_written <= written,
         "{stats:?} write bound {written}"
@@ -172,14 +209,14 @@ async fn operations_per_row_do_not_grow_with_input_size() {
         let bound = rows / ROWS_PER_OP + OPS_PER_RUN * runs + FIXED_OPS;
         assert!(ops <= bound, "{rows} rows: {ops} ops, bound {bound}");
     }
-    // Ops per row stay flat: carries add one frontier level per doubling
-    // of the run count, amortized over a whole chunk, so 25x the rows may
-    // raise the per-row rate by at most half. Per-row I/O paid >= 1 op per
+    // Ops per row stay flat: carries add one frontier level per sixteenfold
+    // growth of the run count, amortized over a whole chunk, so 25x the
+    // rows must not raise the per-row rate. Per-row I/O paid >= 1 op per
     // row per level, so its rate tripled across these sizes.
     let (small_rows, small_ops, _) = per_row[0];
     let (large_rows, large_ops, _) = per_row[2];
     assert!(
-        2 * large_ops * small_rows <= 3 * small_ops * large_rows,
+        large_ops * small_rows <= small_ops * large_rows,
         "ops per row grew: {per_row:?}"
     );
 }
@@ -191,15 +228,15 @@ async fn small_fan_in_cascades_in_logarithmic_passes() {
     let workload = Workload::new(3_100, 64 << 10, 2);
     let stats = workload.run().await;
     let fan_in = workload.fan_in();
-    let frontier = stats.frontier();
+    let carry = workload.carry_fan_in();
+    let frontier = stats.frontier(carry);
     assert!(frontier > fan_in * fan_in, "{stats:?} must force a cascade");
     // The cascade folds until at most `fan_in` runs remain for streaming.
-    let passes = stats.frontier_depth(fan_in) - 1;
+    let passes = stats.frontier_depth(carry, fan_in) - 1;
     assert_eq!(stats.merge_passes, passes, "{stats:?}");
     assert!(stats.merge_groups <= frontier, "{stats:?}");
     assert!(stats.max_open_merge_readers <= fan_in, "{stats:?}");
-    let carries = stats.runs_spilled - frontier;
-    assert_eq!(stats.carry_merges, carries, "{stats:?}");
+    assert_eq!(stats.carry_merges, stats.carries(carry), "{stats:?}");
     stats.assert_reads_bounded();
 }
 
