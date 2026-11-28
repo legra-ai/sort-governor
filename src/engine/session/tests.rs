@@ -70,7 +70,7 @@ async fn full_retained_run_spills_before_the_next_row_arrives() {
 #[tokio::test]
 async fn spill_frontier_stays_bounded_and_preserves_first_equal_row() {
     for rows in [255, 257] {
-        for max_fan_in in [2, 3, 7] {
+        for max_fan_in in [2, 3, 7, 16, 17, 64] {
             for dedup in [false, true] {
                 assert_bounded_sort(rows, max_fan_in, dedup).await;
             }
