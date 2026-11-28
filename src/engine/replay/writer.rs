@@ -153,6 +153,12 @@ impl<V: Serialize + DeserializeOwned + Send + 'static> ReplayWriter<V> {
             .expect("prepared replay writer")
             .write_row(&row)
             .await?;
+        // Publication promises the whole frame is on disk.
+        self.writer
+            .as_mut()
+            .expect("prepared replay writer")
+            .flush()
+            .await?;
         self.rows = next;
         inner.publication.publish(next)?;
         operation.complete();

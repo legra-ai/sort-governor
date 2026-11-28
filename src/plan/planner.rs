@@ -8,6 +8,9 @@ use crate::plan::kind::SortPlan;
 use crate::snapshot::SorterSnapshot;
 use crate::spec::SortSpec;
 
+/// Share of free memory one unknown-size sort's run buffer may plan for.
+const UNKNOWN_SIZE_MEMORY_SHARE: u64 = 8;
+
 /// Chooses how a sort runs. Stateless; every input is explicit so the
 /// decision is exhaustively unit-testable.
 pub struct SortPlanner;
@@ -61,15 +64,28 @@ impl SortPlanner {
         max_fan_in: u32,
     ) -> usize {
         let fan = u64::from(max_fan_in);
-        let two_pass_target = spec
-            .estimated_bytes()
-            .div_ceil(fan.saturating_mul(fan).max(1));
+        let target = if spec.estimated_bytes() == 0 {
+            Self::unknown_size_target(snap)
+        } else {
+            spec.estimated_bytes()
+                .div_ceil(fan.saturating_mul(fan).max(1))
+        };
         let mem_cap = snap
             .available_memory_bytes()
             .max(cfg.min_run_buffer_bytes());
-        let buffer = two_pass_target
+        let buffer = target
             .clamp(cfg.min_run_buffer_bytes(), cfg.max_run_buffer_bytes())
             .min(mem_cap);
         usize::try_from(buffer).unwrap_or(usize::MAX)
+    }
+
+    /// An unknown-size (streamed) input claims a fair slice of the memory
+    /// that is free now, shared with the external sorts in flight, rather
+    /// than spilling at the configured minimum while memory sits idle. The
+    /// session still caps its live buffer by its own budget at run time, so
+    /// a small governed pool keeps spilling before the input ends.
+    fn unknown_size_target(snap: &SorterSnapshot) -> u64 {
+        let sorts = u64::from(snap.active_external_sorts()).saturating_add(1);
+        snap.available_memory_bytes() / sorts.saturating_mul(UNKNOWN_SIZE_MEMORY_SHARE)
     }
 }
