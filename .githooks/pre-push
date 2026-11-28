@@ -1,0 +1,5 @@
+#!/bin/sh
+# Refuse AI-agent pushes to the default branch (owner pushes are unaffected).
+REPO_ROOT=$(git rev-parse --show-toplevel) || exit 1
+bash "$REPO_ROOT/scripts/agent-default-branch-guard.sh" push
+exit $?

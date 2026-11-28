@@ -6,3 +6,9 @@ if ! head -n 1 "$1" | grep -qE '^(feat|fix|build|chore|docs|style|ci|refactor|pe
     echo "Example: feat(cache): add bounded cache"
     exit 1
 fi
+# Mark the commit as hook-checked so CI can tell it did not skip the hooks.
+HOOK_REPO_ROOT=$(git rev-parse --show-toplevel) || exit 1
+if ! python3 "$HOOK_REPO_ROOT/scripts/hook-trailer.py" add "$1"; then
+    echo "Error: could not record the hook trailer."
+    exit 1
+fi
