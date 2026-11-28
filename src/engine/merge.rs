@@ -35,6 +35,7 @@ use crate::engine::run::{
     RunReader,
     RunWriter,
 };
+use crate::engine::work::OpenReader;
 use crate::error::SorterError;
 
 /// A boxed value stream — the merge's public output shape.
@@ -46,6 +47,7 @@ struct MergeSource<K, V> {
     head: Option<RunRow<K, V>>,
     reader: RunReader<K, V>,
     key_charge: Option<MemoryCharge>,
+    _open: OpenReader,
 }
 
 impl<K, V> MergeSource<K, V>
@@ -60,12 +62,14 @@ where
         budget: Arc<MemoryBudget>,
         io: Arc<IoScope>,
     ) -> Result<Option<Self>, SorterError> {
+        let open = OpenReader::new(&io);
         let mut reader = RunReader::open(path, fds, budget, io).await?;
         match reader.next_row().await? {
             Some(head) => Ok(Some(Self {
                 head: Some(head),
                 reader,
                 key_charge: None,
+                _open: open,
             })),
             None => Ok(None),
         }
@@ -257,12 +261,14 @@ where
     let mut pass = 0u32;
     while runs.len() > fan_in {
         // bounded: the session hands over at most 64 frontier paths.
+        io.work().merge_pass();
         let mut next = Vec::new();
         for (group_idx, group) in runs.chunks(fan_in).enumerate() {
             if group.len() == 1 {
                 next.push(group[0].clone());
                 continue;
             }
+            io.work().merge_group();
             let out = dir.join(format!("merge-{pass:03}-{group_idx:05}.cbor"));
             next.push(
                 merge_group_to_file::<K, V>(

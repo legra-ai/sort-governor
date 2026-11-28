@@ -17,18 +17,25 @@ use tokio::sync::{
 };
 
 use crate::engine::budget::MemoryBudget;
+use crate::engine::work::WorkCounters;
 use crate::error::SorterError;
 
 #[derive(Debug, Default)]
 pub(crate) struct IoScope {
     pending: AtomicUsize,
     changed: Notify,
+    work: WorkCounters,
 }
 
 impl IoScope {
     fn start(self: &Arc<Self>) -> IoGuard {
         self.pending.fetch_add(1, Ordering::AcqRel);
         IoGuard(Arc::clone(self))
+    }
+
+    /// Work recorded by operations of this scope (no-ops by default).
+    pub(crate) fn work(&self) -> &WorkCounters {
+        &self.work
     }
 
     pub(crate) async fn idle(&self) {
@@ -95,6 +102,7 @@ where
     T: Send + 'static,
     F: Future<Output = Result<T, SorterError>> + Send + 'static,
 {
+    scope.work().perform_op();
     let guard = scope.start();
     let permit = fds.acquire_owned().await.map_err(|_| SorterError::Gone)?;
     // bounded: one owned filesystem job per actual descriptor permit.

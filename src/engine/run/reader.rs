@@ -68,6 +68,7 @@ impl<K: DeserializeOwned, V: DeserializeOwned> RunReader<K, V> {
             },
         )
         .await?;
+        io.work().read(8);
         Ok(Self::from_position(path, 8, remaining, fds, budget, io))
     }
 
@@ -180,6 +181,7 @@ impl<K: DeserializeOwned, V: DeserializeOwned> RunReader<K, V> {
             },
         )
         .await?;
+        self.io.work().read(bytes.len());
         Ok(ReadChunk {
             bytes,
             consumed: 0,

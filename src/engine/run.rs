@@ -14,3 +14,6 @@ mod writer;
 
 pub(crate) use reader::RunReader;
 pub(crate) use writer::RunWriter;
+
+#[cfg(test)]
+mod tests;

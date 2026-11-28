@@ -26,15 +26,27 @@ pub struct SortOutput<V> {
     scratch: Option<AsyncCleanupGuard>,
     closing: Option<Closing>,
     hold: Option<Box<dyn Send>>,
+    #[cfg(any(test, feature = "work-stats"))]
+    work: std::sync::Arc<super::operation::IoScope>,
 }
 
 impl<V> SortOutput<V> {
+    /// Work recorded by the session and by streaming these values so far.
+    #[cfg(any(test, feature = "work-stats"))]
+    #[doc(hidden)]
+    #[must_use]
+    pub fn work_stats(&self) -> super::work::WorkStats {
+        self.work.work().snapshot()
+    }
+
     pub(crate) fn new(
         rows: ValueStream<V>,
         scratch: AsyncCleanupGuard,
         hold: Option<Box<dyn Send>>,
     ) -> Self {
         Self {
+            #[cfg(any(test, feature = "work-stats"))]
+            work: scratch.scope(),
             rows: Some(rows),
             scratch: Some(scratch),
             closing: None,

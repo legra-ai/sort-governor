@@ -30,6 +30,8 @@ use crate::error::SorterError;
 use crate::plan::SortPlan;
 
 mod buffer;
+#[cfg(any(test, feature = "work-stats"))]
+mod work;
 
 #[cfg(test)]
 mod tests;
@@ -342,6 +344,7 @@ where
             writer.write_row(row).await?;
         }
         let mut run = writer.finish().await?;
+        self.cleanup.scope().work().run_spilled();
         self.buffer = Vec::new();
         self.buffer_charge = None;
         self.buffer_bytes = 0;
@@ -355,6 +358,7 @@ where
                 .dir
                 .join(format!("carry-{ordinal:020}-{level:02}.cbor"));
             // bounded: two adjacent runs, older first for stable equal keys.
+            self.cleanup.scope().work().carry_merge();
             run = merge_group_to_file::<K, V>(
                 &[older, run],
                 output,
