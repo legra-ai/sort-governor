@@ -21,8 +21,9 @@ use crate::engine::budget::{
 };
 use crate::engine::cleanup::AsyncCleanupGuard;
 use crate::engine::merge::{
+    HeadBound,
     cascade_and_stream,
-    merge_group_to_file,
+    merge_carry_to_file,
 };
 use crate::engine::output::SortOutput;
 use crate::engine::row::RunRow;
@@ -52,6 +53,8 @@ pub struct SortSession<K, V> {
     buffer: Vec<RunRow<K, V>>,
     buffer_bytes: usize,
     spills: SpillFrontier,
+    /// Largest admitted row and frame, bounding what each merge source holds.
+    heads: HeadBound,
     next_run: u64,
     failed: bool,
     hold: Option<Box<dyn Send>>,
@@ -89,6 +92,7 @@ where
             buffer: Vec::new(),
             buffer_bytes: 0,
             spills: SpillFrontier::new(plan),
+            heads: HeadBound::default(),
             next_run: 0,
             failed: false,
             hold: None,
@@ -181,6 +185,7 @@ where
             self.spill().await?;
         }
         let charge = self.budget.reserve(bytes)?;
+        self.heads.observe_row(bytes);
         self.grow_buffer()?;
         let mut row = RunRow::new(key, value);
         row.ordinal = self.next_row;
@@ -247,6 +252,7 @@ where
             fan_in.max(2),
             dir,
             self.dedup,
+            self.heads,
             RunResources::new(Arc::clone(&self.fds), Arc::clone(&self.budget), io),
         )
         .await?;
@@ -339,6 +345,7 @@ where
         for row in &self.buffer {
             writer.write_row(row).await?;
         }
+        self.heads.observe_frame(writer.heaviest_frame());
         let run = writer.finish().await?;
         self.cleanup.scope().work().run_spilled();
         self.buffer = Vec::new();
@@ -352,13 +359,16 @@ where
                 .join(format!("carry-{ordinal:020}-{merge:02}.cbor"));
             merge += 1;
             self.cleanup.scope().work().carry_merge();
-            let merged = merge_group_to_file::<K, V>(
+            let width = self.heads.merge_width(&self.budget, carry.paths().len());
+            let merged = merge_carry_to_file::<K, V>(
                 carry.paths(),
                 output,
-                false,
-                Arc::clone(&self.fds),
-                Arc::clone(&self.budget),
-                self.cleanup.scope(),
+                width,
+                &RunResources::new(
+                    Arc::clone(&self.fds),
+                    Arc::clone(&self.budget),
+                    self.cleanup.scope(),
+                ),
             )
             .await?;
             self.spills.settle(carry, merged);

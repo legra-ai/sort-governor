@@ -22,6 +22,10 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tokio::sync::Semaphore;
 
+use self::fold::{
+    FoldNames,
+    fold_to_width,
+};
 use self::heap::SourceHeap;
 use crate::engine::budget::{
     MemoryBudget,
@@ -37,7 +41,12 @@ use crate::engine::run::{
 use crate::engine::work::OpenReader;
 use crate::error::SorterError;
 
+mod fold;
 mod heap;
+mod width;
+
+pub(crate) use fold::merge_carry_to_file;
+pub(crate) use width::HeadBound;
 
 /// A boxed value stream — the merge's public output shape.
 pub(crate) type ValueStream<V> = Pin<Box<dyn Stream<Item = Result<V, SorterError>> + Send>>;
@@ -246,51 +255,28 @@ where
     Ok(merged)
 }
 
-/// Fold `runs` down to `≤ fan_in` files, then stream the final merge.
-/// The session retains cleanup ownership throughout this awaited setup.
+/// Fold `runs` down to at most `fan_in` files — fewer when `heads` says
+/// the budget cannot hold that many sources open — then stream the final
+/// merge. The session retains cleanup ownership throughout this setup.
 pub(crate) async fn cascade_and_stream<K, V>(
-    mut runs: Vec<PathBuf>,
+    runs: Vec<PathBuf>,
     fan_in: usize,
     dir: PathBuf,
     dedup: bool,
+    heads: HeadBound,
     resources: RunResources,
 ) -> Result<ValueStream<V>, SorterError>
 where
     K: Ord + Clone + Serialize + DeserializeOwned + Send + 'static,
     V: Serialize + DeserializeOwned + Send + 'static,
 {
+    let width = heads.merge_width(&resources.memory, fan_in);
+    let runs = fold_to_width::<K, V>(runs, width, FoldNames::Cascade(&dir), &resources).await?;
     let RunResources {
         fds,
         memory: budget,
         io,
     } = resources;
-    let mut pass = 0u32;
-    while runs.len() > fan_in {
-        // bounded: the session hands over at most 64 frontier paths.
-        io.work().merge_pass();
-        let mut next = Vec::new();
-        for (group_idx, group) in runs.chunks(fan_in).enumerate() {
-            if group.len() == 1 {
-                next.push(group[0].clone());
-                continue;
-            }
-            io.work().merge_group();
-            let out = dir.join(format!("merge-{pass:03}-{group_idx:05}.cbor"));
-            next.push(
-                merge_group_to_file::<K, V>(
-                    group,
-                    out,
-                    false,
-                    Arc::clone(&fds),
-                    Arc::clone(&budget),
-                    Arc::clone(&io),
-                )
-                .await?,
-            );
-        }
-        runs = next;
-        pass += 1;
-    }
     let state = MergeState::<K, V>::open(&runs, dedup, fds, budget, io).await?;
     Ok(value_stream(state))
 }
