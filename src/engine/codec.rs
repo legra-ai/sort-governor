@@ -8,10 +8,7 @@ use std::sync::Arc;
 
 use serde::Serialize;
 
-use crate::engine::budget::{
-    MemoryBudget,
-    MemoryCharge,
-};
+use crate::engine::budget::MemoryBudget;
 use crate::error::SorterError;
 
 struct Counter {
@@ -34,40 +31,48 @@ impl Write for Counter {
     }
 }
 
-pub(crate) fn encode<T: Serialize>(
+/// Encoded size of `value`, refusing values larger than the budget.
+pub(crate) fn encoded_len<T: Serialize>(
     value: &T,
     budget: &Arc<MemoryBudget>,
-) -> Result<(Vec<u8>, MemoryCharge), SorterError> {
+) -> Result<usize, SorterError> {
     let mut count = Counter {
         bytes: 0,
         limit: usize::try_from(budget.limit()).unwrap_or(usize::MAX),
     };
     ciborium::ser::into_writer(value, &mut count)
         .map_err(|error| SorterError::Encode(error.to_string()))?;
-    let charge = budget.reserve_frame(count.bytes)?;
-    let mut writer = FrameWriter {
-        bytes: Vec::with_capacity(count.bytes),
-        limit: count.bytes,
-    };
-    ciborium::ser::into_writer(value, &mut writer)
-        .map_err(|error| SorterError::Encode(error.to_string()))?;
-    let bytes = writer.bytes;
-    if bytes.len() != count.bytes || bytes.capacity() > count.bytes {
-        return Err(SorterError::Encode(
-            "serialization changed between sizing and encoding".into(),
-        ));
-    }
-    Ok((bytes, charge))
+    Ok(count.bytes)
 }
 
-struct FrameWriter {
-    bytes: Vec<u8>,
-    limit: usize,
+/// Append `value` to `buffer` without growing it past its charged capacity.
+/// `false` when it does not fit; `buffer` may then hold a partial tail the
+/// caller truncates.
+pub(crate) fn encode_into<T: Serialize>(
+    value: &T,
+    buffer: &mut Vec<u8>,
+) -> Result<bool, SorterError> {
+    let mut writer = CapacityWriter {
+        bytes: buffer,
+        overflow: false,
+    };
+    match ciborium::ser::into_writer(value, &mut writer) {
+        Ok(()) => Ok(true),
+        Err(_) if writer.overflow => Ok(false),
+        Err(error) => Err(SorterError::Encode(error.to_string())),
+    }
 }
-impl Write for FrameWriter {
+
+/// Appends into a pre-charged buffer, failing instead of reallocating.
+struct CapacityWriter<'a> {
+    bytes: &'a mut Vec<u8>,
+    overflow: bool,
+}
+impl Write for CapacityWriter<'_> {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        if bytes.len() > self.limit - self.bytes.len() {
-            return Err(io::Error::other("serialized row changed after sizing"));
+        if bytes.len() > self.bytes.capacity() - self.bytes.len() {
+            self.overflow = true;
+            return Err(io::Error::other("frame exceeds charged chunk"));
         }
         self.bytes.extend_from_slice(bytes);
         Ok(bytes.len())
